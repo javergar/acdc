@@ -109,6 +109,8 @@ impl SnapshotReader {
         let mut total_rows: u64 = 0;
         let chunk_size = 5000;
 
+        info!(table, pk_columns = ?pk_cols, chunk_size, "Starting snapshot for table");
+
         if pk_cols.is_empty() {
             // No primary key — full table scan (no chunking)
             warn!(table, "No primary key, doing full table scan without chunking");
@@ -183,6 +185,9 @@ impl SnapshotReader {
                     total_rows,
                     "Snapshot chunk"
                 );
+                if total_rows % 100_000 < chunk_size as u64 && total_rows >= 100_000 {
+                    info!(table, rows_so_far = total_rows, "Snapshot progress");
+                }
 
                 if chunk_len < chunk_size {
                     break; // Last chunk
@@ -230,6 +235,9 @@ impl SnapshotReader {
                     total_rows,
                     "Snapshot chunk (composite PK)"
                 );
+                if total_rows % 100_000 < chunk_size as u64 && total_rows >= 100_000 {
+                    info!(table, rows_so_far = total_rows, "Snapshot progress");
+                }
 
                 if chunk_len < chunk_size as usize {
                     break;

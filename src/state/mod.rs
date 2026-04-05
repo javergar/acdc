@@ -5,7 +5,7 @@ use bytes::Bytes;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::config::SinkConfig;
 use crate::error::retry;
@@ -91,7 +91,7 @@ impl OffsetStore {
             }
         })
         .await?;
-        info!(
+        debug!(
             file = %offset.binlog_file,
             position = offset.binlog_position,
             seq = offset.cdc_seq,

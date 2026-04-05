@@ -11,7 +11,7 @@ use mysql_async::binlog::value::BinlogValue;
 use mysql_async::binlog::EventFlags;
 use mysql_async::prelude::*;
 use mysql_async::Pool;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::schema::TableMeta;
 use super::types::{CdcEvent, CdcOp, ColumnMeta, ColumnValue, ConversionError, PipelineMessage, TableId};
@@ -73,13 +73,13 @@ impl BinlogSource {
     ) -> Result<BinlogPosition, SourceError> {
         let (filename, position) = match start_from {
             Some(pos) => {
-                debug!(filename = %pos.filename, position = pos.position, "Resuming binlog from saved position");
+                info!(filename = %pos.filename, position = pos.position, "Resuming binlog from saved position");
                 (pos.filename, pos.position)
             }
             None => {
                 let mut conn = self.pool.get_conn().await?;
                 let pos = get_master_status(&mut conn).await?;
-                debug!(filename = %pos.0, position = pos.1, "Starting binlog from current position");
+                info!(filename = %pos.0, position = pos.1, "Starting binlog from current position");
                 pos
             }
         };
@@ -96,12 +96,20 @@ impl BinlogSource {
             position,
         };
 
+        // Initialize shared position so stats/offset saves have valid data from the start
+        if let Ok(mut sp) = self.shared_position.lock() {
+            sp.filename = filename;
+            sp.position = position;
+        }
+
         let mut shutdown_check = tokio::time::interval(std::time::Duration::from_secs(1));
         shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut was_idle = true; // start as idle to avoid spurious "caught up" on first tick
 
         loop {
             let result = tokio::select! {
                 item = binlog_stream.next() => {
+                    was_idle = false;
                     match item {
                         Some(r) => r,
                         None => break, // stream ended
@@ -111,6 +119,14 @@ impl BinlogSource {
                     if shutdown.load(Ordering::Relaxed) {
                         debug!("Shutdown signal received, stopping binlog reader");
                         break;
+                    }
+                    if !was_idle {
+                        info!(
+                            binlog_file = %current_position.filename,
+                            binlog_position = current_position.position,
+                            "CDC caught up — tailing live binlog"
+                        );
+                        was_idle = true;
                     }
                     continue;
                 }
@@ -154,7 +170,7 @@ impl BinlogSource {
                     if let Ok(Some(EventData::RotateEvent(rotate))) = event.read_data() {
                         let new_filename = rotate.name().to_string();
                         let new_position = rotate.position();
-                        debug!(
+                        info!(
                             filename = %new_filename,
                             position = new_position,
                             "Binlog rotation"

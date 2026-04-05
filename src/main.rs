@@ -9,10 +9,10 @@ mod state;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, info_span, warn};
 
 use crate::config::{Config, SinkMode, SourceMode};
 use crate::health::{serve_health, HealthState};
@@ -35,8 +35,9 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load(&config_path)
         .with_context(|| format!("Failed to load config from {}", config_path))?;
 
+    print_banner(&config);
     init_tracing(&config.observability);
-    info!(config_path = %config_path, "Starting ACDC");
+    info!(config = %config, "Starting ACDC");
 
     // Connect to MySQL
     let mysql_url = format!(
@@ -172,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
     let flush_interval = Duration::from_secs(config.sink.writer.flush_interval_secs);
 
     // --- Snapshot phase (if configured and not already done) ---
+    let _snapshot_span = info_span!("snapshot").entered();
     let snapshot_already_done = saved_offset
         .as_ref()
         .map(|o| !o.snapshot_complete.is_empty())
@@ -264,6 +266,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // --- CDC phase ---
+    drop(_snapshot_span);
+    let _cdc_span = info_span!("cdc").entered();
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PipelineMessage>(1024);
 
     let shared_binlog_pos = Arc::new(Mutex::new(source::binlog::BinlogPosition {
@@ -289,10 +294,20 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Main event loop using tokio::select! for composable signal handling
+    let start_time = Instant::now();
+    let mut last_stats_seq: i64 = sequence.load(Ordering::Relaxed);
+
     let mut flush_timer = tokio::time::interval(flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut offset_timer = tokio::time::interval(offset_save_interval);
     offset_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let stats_interval_secs = config.observability.stats_interval_secs;
+    let stats_duration = Duration::from_secs(stats_interval_secs);
+    let mut stats_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + stats_duration,
+        stats_duration,
+    );
+    stats_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -327,10 +342,40 @@ async fn main() -> anyhow::Result<()> {
                         total_rows += batch.num_rows() as u64;
                         writer.write_batch(&table_id.table, batch).await?;
                     }
+                    info!(tables = batches.len(), rows = total_rows, "Timer flush");
                     let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
                     hs.events_processed += total_rows;
                     hs.last_flush_at = Some(chrono::Utc::now());
+                } else {
+                    debug!("Flush tick — no buffered data");
                 }
+            }
+            _ = stats_timer.tick() => {
+                let current_seq = sequence.load(Ordering::Relaxed);
+                let delta = current_seq - last_stats_seq;
+                let rate = if stats_interval_secs > 0 {
+                    delta as f64 / stats_interval_secs as f64
+                } else {
+                    0.0
+                };
+                let pos = shared_binlog_pos.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                info!(
+                    events_total = current_seq,
+                    events_interval = delta,
+                    events_per_sec = format!("{:.1}", rate),
+                    buffered_rows = pipeline.total_buffered(),
+                    binlog_file = %pos.filename,
+                    binlog_position = pos.position,
+                    uptime_secs = start_time.elapsed().as_secs(),
+                    "Stats"
+                );
+                // Update health state with current binlog position
+                {
+                    let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
+                    hs.binlog_file = pos.filename;
+                    hs.binlog_position = pos.position;
+                }
+                last_stats_seq = current_seq;
             }
             _ = offset_timer.tick() => {
                 if let Some(ref store) = offset_store {
@@ -351,7 +396,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if shutdown.load(Ordering::Relaxed) {
-            info!("Shutting down — flushing remaining buffers...");
+            info!(
+                total_events = sequence.load(Ordering::Relaxed),
+                uptime_secs = start_time.elapsed().as_secs(),
+                "Shutting down — flushing remaining buffers..."
+            );
             break;
         }
     }
@@ -364,7 +413,8 @@ async fn main() -> anyhow::Result<()> {
         writer.write_batch(&table_id.table, batch).await?;
     }
     if !batches.is_empty() {
-        info!(tables = batches.len(), "Final flush complete");
+        let total: usize = batches.iter().map(|(_, b)| b.num_rows()).sum();
+        info!(tables = batches.len(), total_rows = total, "Final flush complete");
     }
 
     // 2. Wait for source to finish and get final position
@@ -409,8 +459,46 @@ async fn main() -> anyhow::Result<()> {
         Ok(Err(e)) => warn!(error = %e, "MySQL pool disconnect error"),
         Err(_) => warn!("MySQL pool disconnect timed out"),
     }
-    info!("Shutdown complete");
+    let final_pos = shared_binlog_pos.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    info!(
+        binlog_file = %final_pos.filename,
+        binlog_position = final_pos.position,
+        total_events = sequence.load(Ordering::Relaxed),
+        uptime_secs = start_time.elapsed().as_secs(),
+        "Shutdown complete"
+    );
     Ok(())
+}
+
+fn print_banner(config: &Config) {
+    const BANNER: &str = r#"
+    ___   ____________ ______
+   /   | / ____/ __ \/ ____/
+  / /| |/ /   / / / / /
+ / ___ / /___/ /_/ / /___
+/_/  |_\____/_____/\____/
+"#;
+    eprintln!("{}", BANNER);
+    eprintln!(
+        "  Alberto's CDC  v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    eprintln!("  MySQL binlog -> Apache Iceberg");
+    eprintln!();
+    eprintln!(
+        "  source: {}:{}/{} tables=[{}]",
+        config.source.host,
+        config.source.port,
+        config.source.database,
+        config.source.tables.join(", "),
+    );
+    eprintln!(
+        "  sink:   {} | batch={} flush={}s",
+        config.sink.mode,
+        config.sink.writer.batch_size,
+        config.sink.writer.flush_interval_secs,
+    );
+    eprintln!();
 }
 
 fn init_tracing(config: &config::ObservabilityConfig) {

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -6,6 +8,23 @@ pub struct Config {
     pub sink: SinkConfig,
     pub state: StateConfig,
     pub observability: ObservabilityConfig,
+}
+
+impl fmt::Display for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "source={}:{}/{} tables=[{}] mode={} sink={} batch_size={} flush_interval={}s",
+            self.source.host,
+            self.source.port,
+            self.source.database,
+            self.source.tables.join(", "),
+            self.source.mode,
+            self.sink.mode,
+            self.sink.writer.batch_size,
+            self.sink.writer.flush_interval_secs,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,6 +48,15 @@ pub enum SourceMode {
     FullLoadThenCdc,
 }
 
+impl fmt::Display for SourceMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CdcOnly => write!(f, "cdc_only"),
+            Self::FullLoadThenCdc => write!(f, "full_load_then_cdc"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SinkMode {
@@ -36,6 +64,16 @@ pub enum SinkMode {
     Local,
     S3,
     Iceberg,
+}
+
+impl fmt::Display for SinkMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local => write!(f, "local"),
+            Self::S3 => write!(f, "s3"),
+            Self::Iceberg => write!(f, "iceberg"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +128,8 @@ pub struct ObservabilityConfig {
     pub json_logs: bool,
     #[serde(default = "default_health_bind")]
     pub health_check_bind: String,
+    #[serde(default = "default_stats_interval")]
+    pub stats_interval_secs: u64,
 }
 
 fn default_source_mode() -> SourceMode {
@@ -106,6 +146,10 @@ fn default_flush_interval() -> u64 {
 
 fn default_file_size() -> usize {
     128
+}
+
+fn default_stats_interval() -> u64 {
+    30
 }
 
 fn default_log_level() -> String {

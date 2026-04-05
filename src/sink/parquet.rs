@@ -8,6 +8,8 @@ use object_store::ObjectStore;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use std::time::Instant;
+
 use tracing::info;
 
 use crate::config::SinkConfig;
@@ -26,6 +28,7 @@ impl LocalParquetWriter {
     }
 
     pub fn write_batch(&mut self, table: &str, batch: &RecordBatch) -> anyhow::Result<String> {
+        let write_start = Instant::now();
         let table_dir = self.output_dir.join(table);
         fs::create_dir_all(&table_dir)?;
 
@@ -43,7 +46,7 @@ impl LocalParquetWriter {
         writer.close()?;
 
         let path_str = path.to_string_lossy().to_string();
-        info!(table, rows = batch.num_rows(), path = %path_str, "Wrote Parquet file");
+        info!(table, rows = batch.num_rows(), elapsed_ms = write_start.elapsed().as_millis() as u64, path = %path_str, "Wrote Parquet file");
         Ok(path_str)
     }
 }
@@ -81,6 +84,7 @@ impl S3ParquetWriter {
         table: &str,
         batch: &RecordBatch,
     ) -> anyhow::Result<String> {
+        let write_start = Instant::now();
         // Write Parquet to in-memory buffer
         let mut buf = Vec::with_capacity(1024 * 1024);
         let props = WriterProperties::builder()
@@ -118,7 +122,7 @@ impl S3ParquetWriter {
         })
         .await?;
 
-        info!(table, rows = batch.num_rows(), path = %s3_key, size_bytes = file_size, "Wrote Parquet to S3");
+        info!(table, rows = batch.num_rows(), elapsed_ms = write_start.elapsed().as_millis() as u64, path = %s3_key, size_bytes = file_size, "Wrote Parquet to S3");
         Ok(s3_key)
     }
 }

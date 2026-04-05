@@ -14,6 +14,8 @@ use object_store::ObjectStore;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use std::time::Instant;
+
 use tracing::{debug, info};
 
 use crate::config::SinkConfig;
@@ -203,6 +205,8 @@ impl IcebergSink {
         table_name: &str,
         batch: &RecordBatch,
     ) -> anyhow::Result<String> {
+        let write_start = Instant::now();
+
         // 1. Ensure table exists in catalog
         self.ensure_table(table_name).await?;
 
@@ -276,6 +280,8 @@ impl IcebergSink {
         info!(
             table = table_name,
             rows = record_count,
+            size_bytes = file_size,
+            elapsed_ms = write_start.elapsed().as_millis() as u64,
             path = %full_s3_uri,
             "Committed to Iceberg"
         );

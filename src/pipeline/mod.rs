@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow_array::builder::*;
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::source::types::{CdcEvent, ColumnValue, TableId};
 
@@ -435,7 +435,7 @@ impl TableBuffer {
             .collect();
         self.row_count = 0;
 
-        info!(
+        debug!(
             table = %self.table_id,
             rows = count,
             "Flushed buffer to RecordBatch"
@@ -559,7 +559,6 @@ impl Pipeline {
     }
 
     /// Total buffered rows across all tables.
-    #[allow(dead_code)]
     pub fn total_buffered(&self) -> usize {
         self.buffers.values().map(|b| b.len()).sum()
     }
