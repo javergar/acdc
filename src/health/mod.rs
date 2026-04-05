@@ -55,7 +55,7 @@ pub async fn serve_health(
         )
         .await;
 
-        let (mut stream, _addr) = match accept {
+        let (stream, _addr) = match accept {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 warn!(error = %e, "Health check accept error");
@@ -64,52 +64,59 @@ pub async fn serve_health(
             Err(_) => continue, // timeout, check shutdown
         };
 
-        // Read the request (we only care about GET /health)
-        let mut buf = [0u8; 1024];
-        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
-
-        let state = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let uptime = state.started_at.elapsed().as_secs();
-
-        // Determine health status
-        let stale_threshold = std::time::Duration::from_secs(flush_interval_secs * 3);
-        let is_healthy = match state.last_flush_at {
-            Some(last) => {
-                let since_flush = chrono::Utc::now() - last;
-                since_flush.to_std().unwrap_or_default() < stale_threshold
-            }
-            None => {
-                // No flush yet — healthy if we just started (< stale_threshold)
-                state.started_at.elapsed() < stale_threshold
-            }
-        };
-
-        let status_code = if is_healthy { 200 } else { 503 };
-        let status_text = if is_healthy { "ok" } else { "stale" };
-
-        let body = serde_json::json!({
-            "status": status_text,
-            "binlog_file": state.binlog_file,
-            "binlog_position": state.binlog_position,
-            "last_flush_at": state.last_flush_at.map(|t| t.to_rfc3339()),
-            "tables": state.tables,
-            "buffer_sizes": state.buffer_sizes,
-            "uptime_secs": uptime,
-            "events_processed": state.events_processed,
+        let state = state.clone();
+        tokio::spawn(async move {
+            handle_health_connection(stream, state, flush_interval_secs).await;
         });
-        let body_str = serde_json::to_string(&body).unwrap_or_default();
-
-        let response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            status_code,
-            if is_healthy { "OK" } else { "Service Unavailable" },
-            body_str.len(),
-            body_str,
-        );
-
-        let _ = stream.write_all(response.as_bytes()).await;
-        debug!(status = status_code, "Health check response");
     }
 
     Ok(())
+}
+
+async fn handle_health_connection(
+    mut stream: tokio::net::TcpStream,
+    state: Arc<Mutex<HealthState>>,
+    flush_interval_secs: u64,
+) {
+    // Read the request (we only care about GET /health)
+    let mut buf = [0u8; 1024];
+    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+
+    let state = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let uptime = state.started_at.elapsed().as_secs();
+
+    let stale_threshold = std::time::Duration::from_secs(flush_interval_secs * 3);
+    let is_healthy = match state.last_flush_at {
+        Some(last) => {
+            let since_flush = chrono::Utc::now() - last;
+            since_flush.to_std().unwrap_or_default() < stale_threshold
+        }
+        None => state.started_at.elapsed() < stale_threshold,
+    };
+
+    let status_code = if is_healthy { 200 } else { 503 };
+    let status_text = if is_healthy { "ok" } else { "stale" };
+
+    let body = serde_json::json!({
+        "status": status_text,
+        "binlog_file": state.binlog_file,
+        "binlog_position": state.binlog_position,
+        "last_flush_at": state.last_flush_at.map(|t| t.to_rfc3339()),
+        "tables": state.tables,
+        "buffer_sizes": state.buffer_sizes,
+        "uptime_secs": uptime,
+        "events_processed": state.events_processed,
+    });
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_code,
+        if is_healthy { "OK" } else { "Service Unavailable" },
+        body_str.len(),
+        body_str,
+    );
+
+    let _ = stream.write_all(response.as_bytes()).await;
+    debug!(status = status_code, "Health check response");
 }

@@ -9,7 +9,7 @@ mod state;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use tracing::{error, info, warn};
@@ -281,8 +281,6 @@ async fn main() -> anyhow::Result<()> {
             .await
     });
 
-    let mut last_flush = Instant::now();
-    let mut last_offset_save = Instant::now();
     let offset_save_interval = Duration::from_secs(60);
     info!(
         batch_size = config.sink.writer.batch_size,
@@ -290,38 +288,38 @@ async fn main() -> anyhow::Result<()> {
         "Listening for binlog events..."
     );
 
-    // Main event loop
-    loop {
-        let timeout = flush_interval
-            .checked_sub(last_flush.elapsed())
-            .unwrap_or(Duration::ZERO);
+    // Main event loop using tokio::select! for composable signal handling
+    let mut flush_timer = tokio::time::interval(flush_interval);
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut offset_timer = tokio::time::interval(offset_save_interval);
+    offset_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(msg)) => {
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
                 match msg {
-                    PipelineMessage::Event(event) => {
+                    Some(PipelineMessage::Event(event)) => {
                         if let Some((table_id, batch)) = pipeline.ingest(&event) {
                             let rows = batch.num_rows() as u64;
                             writer.write_batch(&table_id.table, &batch).await?;
-                            last_flush = Instant::now();
+                            flush_timer.reset();
                             let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
                             hs.events_processed += rows;
                             hs.last_flush_at = Some(chrono::Utc::now());
                         }
                     }
-                    PipelineMessage::SchemaChange { ref table, ref new_schema } => {
-                        if let Some((table_id, batch)) = pipeline.handle_schema_change(table, new_schema.clone()) {
+                    Some(PipelineMessage::SchemaChange { ref table, ref new_schema }) => {
+                        if let Some((table_id, batch)) = pipeline.handle_schema_change(table, new_schema.clone())? {
                             writer.write_batch(&table_id.table, &batch).await?;
                         }
                     }
+                    None => {
+                        info!("Source channel closed");
+                        break;
+                    }
                 }
             }
-            Ok(None) => {
-                info!("Source channel closed");
-                break;
-            }
-            Err(_) => {
-                // Timer flush
+            _ = flush_timer.tick() => {
                 let batches = pipeline.flush_all();
                 if !batches.is_empty() {
                     let mut total_rows = 0u64;
@@ -329,31 +327,27 @@ async fn main() -> anyhow::Result<()> {
                         total_rows += batch.num_rows() as u64;
                         writer.write_batch(&table_id.table, batch).await?;
                     }
-                    last_flush = Instant::now();
                     let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
                     hs.events_processed += total_rows;
                     hs.last_flush_at = Some(chrono::Utc::now());
                 }
             }
-        }
-
-        // Periodic offset persistence (every 60s)
-        if last_offset_save.elapsed() >= offset_save_interval {
-            if let Some(ref store) = offset_store {
-                let pos = shared_binlog_pos.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                if !pos.filename.is_empty() {
-                    let mut offset = BinlogOffset::new(
-                        pos.filename,
-                        pos.position,
-                        sequence.load(Ordering::Relaxed),
-                    );
-                    offset.snapshot_complete = snapshot_state.clone();
-                    if let Err(e) = store.save(&offset).await {
-                        warn!(error = %e, "Failed to save periodic offset");
+            _ = offset_timer.tick() => {
+                if let Some(ref store) = offset_store {
+                    let pos = shared_binlog_pos.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if !pos.filename.is_empty() {
+                        let mut offset = BinlogOffset::new(
+                            pos.filename,
+                            pos.position,
+                            sequence.load(Ordering::Relaxed),
+                        );
+                        offset.snapshot_complete = snapshot_state.clone();
+                        if let Err(e) = store.save(&offset).await {
+                            warn!(error = %e, "Failed to save periodic offset");
+                        }
                     }
                 }
             }
-            last_offset_save = Instant::now();
         }
 
         if shutdown.load(Ordering::Relaxed) {

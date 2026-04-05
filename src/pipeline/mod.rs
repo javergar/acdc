@@ -17,6 +17,8 @@ pub struct TableBuffer {
     schema: SchemaRef,
     /// One builder per column (user columns + CDC metadata columns)
     builders: Vec<ColumnBuilder>,
+    /// Cached column names for user columns (avoids schema lookup on hot path)
+    col_names: Vec<String>,
     row_count: usize,
     schema_version: u64,
 }
@@ -101,39 +103,44 @@ fn rescale_decimal(mantissa: i128, source_scale: i8, target_scale: i8) -> Option
 
 impl ColumnBuilder {
     fn new_for_type(dt: &DataType) -> Self {
+        Self::new_for_type_with_capacity(dt, 0)
+    }
+
+    fn new_for_type_with_capacity(dt: &DataType, capacity: usize) -> Self {
         match dt {
-            DataType::Boolean => Self::Boolean(BooleanBuilder::new()),
-            DataType::Int8 => Self::Int8(Int8Builder::new()),
-            DataType::Int16 => Self::Int16(Int16Builder::new()),
-            DataType::Int32 => Self::Int32(Int32Builder::new()),
-            DataType::Int64 => Self::Int64(Int64Builder::new()),
-            DataType::UInt8 => Self::UInt8(UInt8Builder::new()),
-            DataType::UInt16 => Self::UInt16(UInt16Builder::new()),
-            DataType::UInt32 => Self::UInt32(UInt32Builder::new()),
-            DataType::UInt64 => Self::UInt64(UInt64Builder::new()),
-            DataType::Float32 => Self::Float32(Float32Builder::new()),
-            DataType::Float64 => Self::Float64(Float64Builder::new()),
+            DataType::Boolean => Self::Boolean(BooleanBuilder::with_capacity(capacity)),
+            DataType::Int8 => Self::Int8(Int8Builder::with_capacity(capacity)),
+            DataType::Int16 => Self::Int16(Int16Builder::with_capacity(capacity)),
+            DataType::Int32 => Self::Int32(Int32Builder::with_capacity(capacity)),
+            DataType::Int64 => Self::Int64(Int64Builder::with_capacity(capacity)),
+            DataType::UInt8 => Self::UInt8(UInt8Builder::with_capacity(capacity)),
+            DataType::UInt16 => Self::UInt16(UInt16Builder::with_capacity(capacity)),
+            DataType::UInt32 => Self::UInt32(UInt32Builder::with_capacity(capacity)),
+            DataType::UInt64 => Self::UInt64(UInt64Builder::with_capacity(capacity)),
+            DataType::Float32 => Self::Float32(Float32Builder::with_capacity(capacity)),
+            DataType::Float64 => Self::Float64(Float64Builder::with_capacity(capacity)),
             DataType::Decimal128(p, s) => {
                 Self::Decimal128 {
-                    builder: Decimal128Builder::new().with_precision_and_scale(*p, *s).unwrap(),
+                    builder: Decimal128Builder::with_capacity(capacity)
+                        .with_precision_and_scale(*p, *s).unwrap(),
                     scale: *s,
                 }
             }
-            DataType::Date32 => Self::Date32(Date32Builder::new()),
+            DataType::Date32 => Self::Date32(Date32Builder::with_capacity(capacity)),
             DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                 Self::TimestampMicro(
-                    TimestampMicrosecondBuilder::new()
+                    TimestampMicrosecondBuilder::with_capacity(capacity)
                         .with_timezone(tz.clone().unwrap_or("UTC".into())),
                 )
             }
             DataType::Duration(TimeUnit::Microsecond) => {
-                Self::DurationMicro(DurationMicrosecondBuilder::new())
+                Self::DurationMicro(DurationMicrosecondBuilder::with_capacity(capacity))
             }
-            DataType::Utf8 => Self::Utf8(StringBuilder::new()),
-            DataType::Binary => Self::Binary(BinaryBuilder::new()),
+            DataType::Utf8 => Self::Utf8(StringBuilder::with_capacity(capacity, capacity * 32)),
+            DataType::Binary => Self::Binary(BinaryBuilder::with_capacity(capacity, capacity * 64)),
             other => {
                 warn!(data_type = ?other, "Unsupported Arrow type, falling back to Utf8");
-                Self::Utf8(StringBuilder::new())
+                Self::Utf8(StringBuilder::with_capacity(capacity, capacity * 32))
             }
         }
     }
@@ -346,6 +353,19 @@ impl ColumnBuilder {
 
 impl TableBuffer {
     pub fn new(table_id: TableId, schema: SchemaRef, schema_version: u64) -> Self {
+        let cdc_cols = schema.fields().iter().filter(|f| f.name().starts_with("_cdc_")).count();
+        debug_assert_eq!(
+            cdc_cols, CDC_META_COLS,
+            "CDC_META_COLS ({}) doesn't match actual _cdc_ columns in schema ({})",
+            CDC_META_COLS, cdc_cols
+        );
+
+        let num_user_cols = schema.fields().len() - CDC_META_COLS;
+        let col_names: Vec<String> = schema.fields().iter()
+            .take(num_user_cols)
+            .map(|f| f.name().clone())
+            .collect();
+
         let builders = schema
             .fields()
             .iter()
@@ -356,6 +376,7 @@ impl TableBuffer {
             table_id,
             schema,
             builders,
+            col_names,
             row_count: 0,
             schema_version,
         }
@@ -368,7 +389,7 @@ impl TableBuffer {
         // Append user columns (positional access — both event values and schema
         // columns are ordered by INFORMATION_SCHEMA.ordinal_position)
         for (i, builder) in self.builders.iter_mut().enumerate().take(num_user_cols) {
-            let col_name = self.schema.field(i).name();
+            let col_name = &self.col_names[i];
             let value = event
                 .values
                 .get(i)
@@ -399,20 +420,19 @@ impl TableBuffer {
 
     /// Drain the buffer into a RecordBatch and reset.
     pub fn flush(&mut self) -> anyhow::Result<RecordBatch> {
+        let count = self.row_count;
         let arrays: Vec<arrow::array::ArrayRef> =
             self.builders.iter_mut().map(|b| b.finish()).collect();
 
         let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
 
-        // Reset builders
+        // Reset builders with capacity hint from previous batch size
         self.builders = self
             .schema
             .fields()
             .iter()
-            .map(|f| ColumnBuilder::new_for_type(f.data_type()))
+            .map(|f| ColumnBuilder::new_for_type_with_capacity(f.data_type(), count))
             .collect();
-
-        let count = self.row_count;
         self.row_count = 0;
 
         info!(
@@ -470,27 +490,20 @@ impl Pipeline {
         &mut self,
         tid: &TableId,
         new_schema: SchemaRef,
-    ) -> Option<(TableId, RecordBatch)> {
+    ) -> anyhow::Result<Option<(TableId, RecordBatch)>> {
         info!(table = %tid, "Schema change — flushing old buffer");
         if let Some(buffer) = self.buffers.get_mut(tid) {
             if !buffer.is_empty() {
-                match buffer.flush() {
-                    Ok(batch) => {
-                        self.buffers.remove(tid);
-                        self.update_schema(tid, new_schema);
-                        return Some((tid.clone(), batch));
-                    }
-                    Err(e) => {
-                        warn!(table = %tid, error = %e, "Failed to flush during schema change, keeping old buffer");
-                        return None;
-                    }
-                }
+                let batch = buffer.flush()?;
+                self.buffers.remove(tid);
+                self.update_schema(tid, new_schema);
+                return Ok(Some((tid.clone(), batch)));
             } else {
                 self.buffers.remove(tid);
             }
         }
         self.update_schema(tid, new_schema);
-        None
+        Ok(None)
     }
 
     /// Ingest a single CDC event. Returns a RecordBatch if a flush was triggered.

@@ -77,7 +77,9 @@ pub struct TimeMicroseconds(pub i64);
 pub enum ColumnValue {
     Null,
     /// Conversion failed — treated as NULL in Arrow, but reason preserved for logging.
-    ConversionFailed(String),
+    /// Serializes as null (not as a string) to avoid confusion with real string values.
+    #[serde(skip)]
+    ConversionFailed(#[allow(dead_code)] String),
     #[allow(dead_code)]
     Bool(bool),
     Int(i64),
@@ -186,7 +188,7 @@ pub struct CdcEvent {
 }
 
 /// Message sent through the pipeline channel.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum PipelineMessage {
     /// A CDC row change event.
     Event(CdcEvent),

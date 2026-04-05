@@ -14,8 +14,23 @@ pub enum AcdcError {
     Config(String),
 }
 
+/// Check if an error looks retryable (transient network/server errors).
+/// Non-retryable: auth failures, bad requests, not-found, client errors.
+fn is_retryable(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    // Don't retry client errors (4xx)
+    if msg.contains("403") || msg.contains("401") || msg.contains("400") || msg.contains("404") {
+        return false;
+    }
+    if msg.contains("access denied") || msg.contains("forbidden") || msg.contains("unauthorized") {
+        return false;
+    }
+    true
+}
+
 /// Retry an async operation with exponential backoff.
 /// Starts at 100ms, doubles each attempt, caps at 30s.
+/// Non-retryable errors (auth, client errors) fail immediately.
 pub async fn retry<F, Fut, T>(op_name: &str, max_attempts: u32, f: F) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
@@ -25,7 +40,7 @@ where
     for attempt in 1..=max_attempts {
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e) if attempt < max_attempts => {
+            Err(e) if attempt < max_attempts && is_retryable(&e) => {
                 warn!(
                     op = op_name,
                     attempt,
