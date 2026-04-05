@@ -5,7 +5,12 @@ user = "cdc_user"
 password = "cdc_password"
 server_id = 200
 database = "laravel_app"
-tables = ["users", "teams", "products", "orders", "order_items", "notifications", "activity_log"]
+tables = [
+    "migrations", "password_reset_tokens", "sessions", "cache", "cache_locks",
+    "jobs", "job_batches", "failed_jobs", "personal_access_tokens",
+    "users", "teams", "products", "orders", "order_items",
+    "notifications", "activity_log",
+]
 mode = "full_load_then_cdc"
 snapshot_chunk_size = 1000
 

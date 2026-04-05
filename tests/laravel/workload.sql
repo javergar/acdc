@@ -4,6 +4,21 @@
 -- JSON column mutations, bulk inserts, and order lifecycle state machines.
 -- =============================================================================
 
+-- ─── Phase 0: Framework bookkeeping (artisan migrate writes these) ──────────
+
+INSERT INTO laravel_app.migrations (migration, batch) VALUES
+    ('2014_10_12_000000_create_users_table', 1),
+    ('2014_10_12_100000_create_password_reset_tokens_table', 1),
+    ('2019_12_14_000001_create_personal_access_tokens_table', 1),
+    ('2024_08_14_000000_create_sessions_table', 1),
+    ('2024_08_14_000001_create_cache_table', 1),
+    ('2024_08_14_000002_create_jobs_table', 1),
+    ('2024_09_01_000000_create_teams_table', 2),
+    ('2024_09_01_000001_create_products_table', 2),
+    ('2024_09_01_000002_create_orders_table', 2),
+    ('2024_09_01_000003_create_notifications_table', 2),
+    ('2024_09_01_000004_create_activity_log_table', 2);
+
 -- ─── Phase 1: User registration (Eloquent Model::create) ───────────────────
 
 INSERT INTO laravel_app.users (name, email, password, settings, created_at, updated_at)
@@ -110,6 +125,79 @@ VALUES
 
 -- Mark notification as read
 UPDATE laravel_app.notifications SET read_at = NOW() WHERE id = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+
+-- ─── Phase 7b: Framework tables (sessions, cache, jobs, tokens) ────────────
+
+-- Sessions — SessionManager writes on every request (database driver)
+INSERT INTO laravel_app.sessions (id, user_id, ip_address, user_agent, payload, last_activity)
+VALUES
+    ('abc123def456abc123def456abc123def456abc1', 1, '192.168.1.100', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', 'YTozOntzOjY6Il90b2tlbiI7czo0MDoiYWJjMTIzZGVmNDU2...base64payload', UNIX_TIMESTAMP()),
+    ('def456abc123def456abc123def456abc123def4', 2, '10.0.0.42',     'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',        'YTozOntzOjY6Il90b2tlbiI7czo0MDoiZGVmNDU2YWJjMTIz...base64payload', UNIX_TIMESTAMP());
+
+-- Session touch (happens every request — Eloquent updates last_activity)
+UPDATE laravel_app.sessions SET last_activity = UNIX_TIMESTAMP(), payload = 'YTozOntzOjY6Il90b2...updated_payload' WHERE id = 'abc123def456abc123def456abc123def456abc1';
+
+-- Cache — Cache::put('key', 'value', $ttl)
+INSERT INTO laravel_app.cache (`key`, value, expiration) VALUES
+    ('laravel_cache_user_1_permissions', 's:45:"a:3:{i:0;s:10:\\"view-posts\\";i:1;s:12:\\"create-posts\\";}"', UNIX_TIMESTAMP() + 3600),
+    ('laravel_cache_settings',          's:128:"a:5:{s:9:\\"app_name\\";s:10:\\"MyLaravel\\";}"',               UNIX_TIMESTAMP() + 86400),
+    ('laravel_cache_rate_limit:api:1',  'i:47;',                                                                 UNIX_TIMESTAMP() + 60);
+
+-- Cache::forget
+DELETE FROM laravel_app.cache WHERE `key` = 'laravel_cache_rate_limit:api:1';
+
+-- Cache locks (atomic locks for queue workers)
+INSERT INTO laravel_app.cache_locks (`key`, owner, expiration) VALUES
+    ('laravel_lock_order_process_1', 'abc123owner', UNIX_TIMESTAMP() + 10);
+DELETE FROM laravel_app.cache_locks WHERE `key` = 'laravel_lock_order_process_1';
+
+-- Jobs — dispatch(new ProcessOrderJob($order))
+INSERT INTO laravel_app.jobs (queue, payload, attempts, reserved_at, available_at, created_at) VALUES
+    ('default', '{"uuid":"d4e5f6a7-b8c9-0123-def0-123456789abc","displayName":"App\\\\Jobs\\\\ProcessOrderPayment","job":"Illuminate\\\\Queue\\\\CallQueuedHandler@call","data":{"commandName":"App\\\\Jobs\\\\ProcessOrderPayment","command":"O:35:\\"App\\\\Jobs\\\\ProcessOrderPayment\\":1:{s:7:\\"orderId\\";i:1;}"}}', 0, NULL, UNIX_TIMESTAMP(), UNIX_TIMESTAMP()),
+    ('emails', '{"uuid":"e5f6a7b8-c9d0-1234-ef01-23456789abcd","displayName":"App\\\\Jobs\\\\SendOrderConfirmation","job":"Illuminate\\\\Queue\\\\CallQueuedHandler@call","data":{"commandName":"App\\\\Jobs\\\\SendOrderConfirmation","command":"O:39:\\"App\\\\Jobs\\\\SendOrderConfirmation\\":1:{s:7:\\"orderId\\";i:1;}"}}', 0, NULL, UNIX_TIMESTAMP(), UNIX_TIMESTAMP());
+
+-- Worker picks up and processes a job (reserve then delete)
+UPDATE laravel_app.jobs SET reserved_at = UNIX_TIMESTAMP(), attempts = 1 WHERE id = 1;
+DELETE FROM laravel_app.jobs WHERE id = 1;
+
+-- Job batches — Bus::batch([...])
+INSERT INTO laravel_app.job_batches (id, name, total_jobs, pending_jobs, failed_jobs, failed_job_ids, options, created_at) VALUES
+    ('batch-uuid-001', 'Import Products', 50, 50, 0, '[]', NULL, UNIX_TIMESTAMP());
+
+-- Progress on batch
+UPDATE laravel_app.job_batches SET pending_jobs = 25 WHERE id = 'batch-uuid-001';
+UPDATE laravel_app.job_batches SET pending_jobs = 0, finished_at = UNIX_TIMESTAMP() WHERE id = 'batch-uuid-001';
+
+-- Failed job
+INSERT INTO laravel_app.failed_jobs (uuid, connection, queue, payload, exception, failed_at) VALUES
+    ('f6a7b8c9-d0e1-2345-f012-3456789abcde', 'database', 'emails',
+     '{"uuid":"e5f6a7b8-c9d0-1234-ef01-23456789abcd","displayName":"App\\\\Jobs\\\\SendOrderConfirmation"}',
+     'Symfony\\Component\\Mailer\\Exception\\TransportException: Connection to smtp.example.com timed out in /vendor/symfony/mailer/Transport/Smtp/SmtpTransport.php:234\nStack trace:\n#0 ...',
+     NOW());
+
+-- Sanctum tokens — $user->createToken('api-token')
+INSERT INTO laravel_app.personal_access_tokens (tokenable_type, tokenable_id, name, token, abilities, last_used_at, created_at, updated_at) VALUES
+    ('App\\Models\\User', 1, 'api-token',     '7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d', '["*"]',                      NULL,  NOW(), NOW()),
+    ('App\\Models\\User', 1, 'mobile-token',  'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2', '["read-orders","read-products"]', NULL,  NOW(), NOW()),
+    ('App\\Models\\User', 2, 'ci-token',      '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef', '["deploy"]',                  NOW(), NOW(), NOW());
+
+-- Token used (Sanctum middleware touches last_used_at on every authenticated request)
+UPDATE laravel_app.personal_access_tokens SET last_used_at = NOW() WHERE id = 1;
+UPDATE laravel_app.personal_access_tokens SET last_used_at = NOW() WHERE id = 1;
+UPDATE laravel_app.personal_access_tokens SET last_used_at = NOW() WHERE id = 1;
+
+-- Revoke token — $token->delete()
+DELETE FROM laravel_app.personal_access_tokens WHERE id = 2;
+
+-- Password reset — Password::sendResetLink()
+INSERT INTO laravel_app.password_reset_tokens (email, token, created_at) VALUES
+    ('bob@example.com', '$2y$12$fakehashforpasswordreset.token', NOW());
+
+-- Token consumed after password reset
+DELETE FROM laravel_app.password_reset_tokens WHERE email = 'bob@example.com';
+
+-- Session cleanup (artisan session:gc or gc_probability)
+DELETE FROM laravel_app.sessions WHERE last_activity < (UNIX_TIMESTAMP() - 7200);
 
 -- ─── Phase 8: Activity log (audit trail, high volume) ──────────────────────
 

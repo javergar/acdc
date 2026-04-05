@@ -7,7 +7,7 @@ cd "$(dirname "$0")/../.."
 MYSQL="docker exec -i acdc-mysql mysql -u root -proot"
 ACDC_BIN="./target/debug/acdc"
 CONFIG="tests/laravel/acdc-laravel.toml"
-TABLES=(users teams products orders order_items notifications activity_log)
+TABLES=(migrations password_reset_tokens sessions cache cache_locks jobs job_batches failed_jobs personal_access_tokens users teams products orders order_items notifications activity_log)
 FLUSH_INTERVAL=10  # seconds — shorter for testing
 
 echo "============================================"
@@ -31,8 +31,8 @@ $MYSQL laravel_app < tests/laravel/schema.sql 2>/dev/null
 echo "--- Verifying tables..."
 TABLE_COUNT=$($MYSQL -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='laravel_app';" 2>/dev/null)
 echo "    Found $TABLE_COUNT tables"
-if [ "$TABLE_COUNT" -lt 7 ]; then
-    echo "FAIL: Expected 7 tables, got $TABLE_COUNT"
+if [ "$TABLE_COUNT" -lt 16 ]; then
+    echo "FAIL: Expected 16 tables, got $TABLE_COUNT"
     exit 1
 fi
 

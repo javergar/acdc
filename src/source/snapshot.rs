@@ -104,8 +104,10 @@ impl SnapshotReader {
     ) -> Result<(), SourceError> {
         let db = &self.config.database;
         let table = &table_meta.table_id.table;
-        let col_names: Vec<&str> = table_meta.columns.iter().map(|c| c.name.as_str()).collect();
-        let select_cols = col_names.join(", ");
+        let select_cols = table_meta.columns.iter()
+            .map(|c| format!("`{}`", c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         // Determine chunking strategy based on primary key
         let pk_cols = &table_meta.primary_key_columns;
