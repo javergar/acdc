@@ -96,11 +96,25 @@ impl BinlogSource {
             position,
         };
 
-        while let Some(result) = binlog_stream.next().await {
-            if shutdown.load(Ordering::Relaxed) {
-                debug!("Shutdown signal received, stopping binlog reader");
-                break;
-            }
+        let mut shutdown_check = tokio::time::interval(std::time::Duration::from_secs(1));
+        shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            let result = tokio::select! {
+                item = binlog_stream.next() => {
+                    match item {
+                        Some(r) => r,
+                        None => break, // stream ended
+                    }
+                }
+                _ = shutdown_check.tick() => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        debug!("Shutdown signal received, stopping binlog reader");
+                        break;
+                    }
+                    continue;
+                }
+            };
 
             let event = match result {
                 Ok(e) => e,

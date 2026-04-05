@@ -404,7 +404,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    pool.disconnect().await?;
+    match tokio::time::timeout(Duration::from_secs(5), pool.disconnect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "MySQL pool disconnect error"),
+        Err(_) => warn!("MySQL pool disconnect timed out"),
+    }
     info!("Shutdown complete");
     Ok(())
 }
