@@ -1,0 +1,68 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: acdc-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: testdb
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-format=ROW
+      --binlog-row-image=FULL
+      --gtid-mode=ON
+      --enforce-gtid-consistency=ON
+      --log-replica-updates=ON
+      --binlog-expire-logs-seconds=604800
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql-init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.81
+    container_name: acdc-rustfs
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: acdc_root
+      RUSTFS_SECRET_KEY: acdc_password
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+    volumes:
+      - rustfs_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://127.0.0.1:9000/health && curl --fail http://127.0.0.1:9001/rustfs/console/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  polaris:
+    image: apache/polaris:latest
+    container_name: acdc-polaris
+    ports:
+      - "8181:8181"
+      - "8182:8182"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: acdc_root
+      AWS_SECRET_ACCESS_KEY: acdc_password
+      POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  mysql_data:
+  rustfs_data:

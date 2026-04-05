@@ -1,0 +1,4 @@
+[env]
+PKG_CONFIG_PATH = { value = "/home/alberto/.local/lib/pkgconfig", force = true }
+C_INCLUDE_PATH = { value = "/home/alberto/.local/include", force = true }
+LIBRARY_PATH = { value = "/home/alberto/.local/lib", force = true }

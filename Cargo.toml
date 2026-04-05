@@ -1,0 +1,52 @@
+[package]
+name = "acdc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Alberto's CDC — MySQL binlog to Apache Iceberg"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "signal"] }
+futures = "0.3"
+
+# MySQL
+mysql_async = { version = "0.34", default-features = false, features = ["default-rustls", "binlog"] }
+mysql_common = { version = "0.32", features = ["binlog"] }
+
+# Arrow / Parquet (pinned to 53 to match iceberg 0.4)
+arrow = { version = "53", features = ["prettyprint"] }
+arrow-array = "53"
+arrow-schema = "53"
+parquet = { version = "53", features = ["snap", "async"] }
+
+# Object storage
+object_store = { version = "0.12", features = ["aws"] }
+
+# Iceberg
+iceberg = "0.4"
+iceberg-catalog-rest = "0.4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+toml = "0.8"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Decimal
+rust_decimal = "1.36"
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+flate2 = { version = "1", features = ["rust_backend"], default-features = false }
