@@ -17,11 +17,18 @@ pub enum AcdcError {
 /// Check if an error looks retryable (transient network/server errors).
 /// Non-retryable: auth failures, bad requests, not-found, client errors.
 fn is_retryable(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_lowercase();
-    // Don't retry client errors (4xx)
-    if msg.contains("403") || msg.contains("401") || msg.contains("400") || msg.contains("404") {
-        return false;
+    // Check typed errors first (more reliable than string matching)
+    for cause in err.chain() {
+        if let Some(store_err) = cause.downcast_ref::<object_store::Error>() {
+            return !matches!(
+                store_err,
+                object_store::Error::NotFound { .. }
+                    | object_store::Error::Precondition { .. }
+            );
+        }
     }
+    // Fallback: string matching for errors without typed variants
+    let msg = err.to_string().to_lowercase();
     if msg.contains("access denied") || msg.contains("forbidden") || msg.contains("unauthorized") {
         return false;
     }

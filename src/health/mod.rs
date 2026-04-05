@@ -41,7 +41,7 @@ pub async fn serve_health(
     info!(bind = bind_addr, "Health check listening");
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Acquire) {
             break;
         }
 
@@ -75,9 +75,21 @@ async fn handle_health_connection(
     state: Arc<Mutex<HealthState>>,
     flush_interval_secs: u64,
 ) {
-    // Read the request (we only care about GET /health)
+    // Read the request line
     let mut buf = [0u8; 1024];
-    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+    let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap_or(0);
+    let request_line = std::str::from_utf8(&buf[..n])
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("");
+
+    // Only respond to GET /health (or any path for simplicity — but reject non-GET)
+    if !request_line.starts_with("GET ") {
+        let response = "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(response.as_bytes()).await;
+        return;
+    }
 
     let state = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let uptime = state.started_at.elapsed().as_secs();

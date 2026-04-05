@@ -68,7 +68,7 @@ impl SnapshotReader {
 
         // 3. Snapshot each table
         for table_meta in &self.tables {
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Acquire) {
                 warn!("Shutdown during snapshot, aborting");
                 conn.query_drop("ROLLBACK").await?;
                 return Ok(BinlogPosition {
@@ -121,7 +121,7 @@ impl SnapshotReader {
             let query = format!("SELECT {} FROM `{}`.`{}`", select_cols, db, table);
             let rows: Vec<mysql_async::Row> = conn.query(&query).await?;
             for row in rows {
-                if shutdown.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Acquire) {
                     return Ok(());
                 }
                 let event = self.row_to_event(row, table_meta, snapshot_ts);
@@ -136,7 +136,7 @@ impl SnapshotReader {
             let mut last_pk_value: Option<mysql_async::Value> = None;
 
             loop {
-                if shutdown.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Acquire) {
                     return Ok(());
                 }
 
@@ -198,30 +198,60 @@ impl SnapshotReader {
                 }
             }
         } else {
-            // Composite PK — use LIMIT/OFFSET as fallback (less efficient but correct)
+            // Composite PK — cursor-based pagination using tuple comparison
+            // MySQL supports: WHERE (pk1, pk2) > (:v1, :v2)
             let pk_order = pk_cols
                 .iter()
                 .map(|c| format!("`{}`", c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut offset: u64 = 0;
+            let pk_indices: Vec<usize> = pk_cols
+                .iter()
+                .map(|pk| table_meta.columns.iter().position(|c| c.name == *pk).unwrap_or(0))
+                .collect();
+            let mut last_pk_values: Option<Vec<mysql_async::Value>> = None;
 
             loop {
-                if shutdown.load(Ordering::Relaxed) {
+                if shutdown.load(Ordering::Acquire) {
                     return Ok(());
                 }
 
-                let query = format!(
-                    "SELECT {} FROM `{}`.`{}` ORDER BY {} LIMIT {} OFFSET {}",
-                    select_cols, db, table, pk_order, chunk_size, offset
-                );
+                let rows: Vec<mysql_async::Row> = match &last_pk_values {
+                    None => {
+                        let query = format!(
+                            "SELECT {} FROM `{}`.`{}` ORDER BY {} LIMIT {}",
+                            select_cols, db, table, pk_order, chunk_size
+                        );
+                        conn.query(&query).await?
+                    }
+                    Some(vals) => {
+                        // Build WHERE (pk1, pk2, ...) > (:pk0, :pk1, ...)
+                        let pk_tuple = pk_cols.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ");
+                        let param_list: Vec<String> = (0..pk_cols.len()).map(|i| format!(":pk{}", i)).collect();
+                        let query = format!(
+                            "SELECT {} FROM `{}`.`{}` WHERE ({}) > ({}) ORDER BY {} LIMIT {}",
+                            select_cols, db, table, pk_tuple, param_list.join(", "), pk_order, chunk_size
+                        );
+                        let params: Vec<(Vec<u8>, mysql_async::Value)> = vals.iter().enumerate()
+                            .map(|(i, v)| (format!("pk{}", i).into_bytes(), v.clone()))
+                            .collect();
+                        conn.exec(&query, mysql_async::Params::Named(params.into_iter().collect())).await?
+                    }
+                };
 
-                let rows: Vec<mysql_async::Row> = conn.query(&query).await?;
                 if rows.is_empty() {
                     break;
                 }
 
                 let chunk_len = rows.len();
+
+                // Capture last row's PK values for next cursor
+                let last_row = &rows[rows.len() - 1];
+                last_pk_values = Some(
+                    pk_indices.iter().map(|&idx| {
+                        last_row.get::<mysql_async::Value, _>(idx).unwrap_or(mysql_async::Value::NULL)
+                    }).collect()
+                );
 
                 for row in rows {
                     let event = self.row_to_event(row, table_meta, snapshot_ts);
@@ -230,8 +260,6 @@ impl SnapshotReader {
                     }
                     total_rows += 1;
                 }
-
-                offset += chunk_len as u64;
 
                 debug!(
                     table,
@@ -243,7 +271,7 @@ impl SnapshotReader {
                     info!(table, rows_so_far = total_rows, "Snapshot progress");
                 }
 
-                if chunk_len < chunk_size as usize {
+                if chunk_len < chunk_size {
                     break;
                 }
             }

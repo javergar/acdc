@@ -169,8 +169,20 @@ fn default_health_bind() -> String {
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    fn validate(&mut self) -> anyhow::Result<()> {
+        if self.source.tables.is_empty() {
+            anyhow::bail!("source.tables must not be empty");
+        }
+        self.source.snapshot_chunk_size = self.source.snapshot_chunk_size.max(100);
+        self.sink.writer.batch_size = self.sink.writer.batch_size.clamp(1, 10_000_000);
+        self.sink.writer.flush_interval_secs = self.sink.writer.flush_interval_secs.max(1);
+        self.observability.stats_interval_secs = self.observability.stats_interval_secs.max(1);
+        Ok(())
     }
 }
 

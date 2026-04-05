@@ -16,7 +16,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::time::Instant;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::SinkConfig;
 use crate::error::retry;
@@ -26,6 +26,7 @@ use crate::source::schema::TableMeta;
 pub struct IcebergSink {
     catalog: RestCatalog,
     namespace: NamespaceIdent,
+    ns_name: String,
     s3_store: Arc<dyn ObjectStore>,
     warehouse_prefix: String,
     bucket: String,
@@ -127,6 +128,7 @@ impl IcebergSink {
 
         Ok(Self {
             catalog,
+            ns_name: namespace_str.to_string(),
             namespace,
             s3_store,
             warehouse_prefix: prefix.to_string(),
@@ -143,7 +145,7 @@ impl IcebergSink {
         }
 
         let ident = TableIdent::from_strs([
-            self.namespace.as_ref().first().unwrap().as_str(),
+            self.ns_name.as_str(),
             table_name,
         ])?;
 
@@ -155,19 +157,23 @@ impl IcebergSink {
             }
             Err(e) => {
                 // Only create if the table genuinely doesn't exist.
-                // iceberg-rust 0.4 doesn't expose typed error variants, so match on message.
-                let err_msg = e.to_string().to_lowercase();
-                if !err_msg.contains("not found")
-                    && !err_msg.contains("no such")
-                    && !err_msg.contains("does not exist")
-                    && !err_msg.contains("404")
-                {
+                // iceberg-rust 0.4 wraps iceberg::Error which has kind() and message().
+                let is_not_found = {
+                    let err_msg = e.to_string().to_lowercase();
+                    err_msg.contains("not found")
+                        || err_msg.contains("no such")
+                        || err_msg.contains("does not exist")
+                        || err_msg.contains("404")
+                        || err_msg.contains("nosuchkey")
+                };
+                if !is_not_found {
                     return Err(anyhow::anyhow!(
                         "Failed to load Iceberg table '{}': {}",
                         table_name,
                         e
                     ));
                 }
+                warn!(table = table_name, "Table not found in catalog, creating");
 
                 let arrow_schema = self
                     .schemas
@@ -177,7 +183,7 @@ impl IcebergSink {
                 let iceberg_schema =
                     iceberg::arrow::arrow_schema_to_schema(arrow_schema.as_ref())?;
 
-                let ns_name = self.namespace.as_ref().first().unwrap();
+                let ns_name = &self.ns_name;
                 let creation = TableCreation::builder()
                     .name(table_name.to_string())
                     .schema(iceberg_schema)
@@ -225,7 +231,7 @@ impl IcebergSink {
         // 3. PUT Parquet file to S3
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let id = uuid::Uuid::new_v4();
-        let ns_name = self.namespace.as_ref().first().unwrap();
+        let ns_name = &self.ns_name;
         let relative_path = format!(
             "{}/{}/{}/data/{}-{}.parquet",
             self.warehouse_prefix, ns_name, table_name, timestamp, id
@@ -266,13 +272,21 @@ impl IcebergSink {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build DataFile: {}", e))?;
 
-        // 5. Commit to Iceberg catalog via transaction
+        // 5. Commit to Iceberg catalog via transaction (with retry for transient failures)
         let table = self.tables.get(table_name).unwrap();
-        let tx = Transaction::new(table);
-        let mut action = tx.fast_append(None, vec![])?;
-        action.add_data_files(vec![data_file])?;
-        let tx = action.apply().await?;
-        let updated_table = tx.commit(&self.catalog).await?;
+        let catalog = &self.catalog;
+        let updated_table = retry("iceberg_commit", 3, || {
+            let data_file = data_file.clone();
+            async move {
+                let tx = Transaction::new(table);
+                let mut action = tx.fast_append(None, vec![])?;
+                action.add_data_files(vec![data_file])?;
+                let tx = action.apply().await?;
+                let updated = tx.commit(catalog).await?;
+                Ok(updated)
+            }
+        })
+        .await?;
 
         // Update cached table with new snapshot
         self.tables.insert(table_name.to_string(), updated_table);

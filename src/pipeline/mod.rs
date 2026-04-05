@@ -160,7 +160,8 @@ impl ColumnBuilder {
             (Self::Boolean(b), ColumnValue::UInt(v)) => b.append_value(*v != 0),
             (Self::Boolean(b), ColumnValue::Bool(v)) => b.append_value(*v),
             (Self::Boolean(b), ColumnValue::String(s)) => {
-                b.append_value(s == "1" || s.eq_ignore_ascii_case("true"));
+                // MySQL: any non-zero, non-"false" string is truthy
+                b.append_value(!s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false"));
             }
 
             // --- Integers with bounds checking ---

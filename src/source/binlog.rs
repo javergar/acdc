@@ -105,6 +105,7 @@ impl BinlogSource {
         let mut shutdown_check = tokio::time::interval(std::time::Duration::from_secs(1));
         shutdown_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut was_idle = true; // start as idle to avoid spurious "caught up" on first tick
+        let mut skipped_rows: u64 = 0;
 
         loop {
             let result = tokio::select! {
@@ -116,7 +117,7 @@ impl BinlogSource {
                     }
                 }
                 _ = shutdown_check.tick() => {
-                    if shutdown.load(Ordering::Relaxed) {
+                    if shutdown.load(Ordering::Acquire) {
                         debug!("Shutdown signal received, stopping binlog reader");
                         break;
                     }
@@ -264,7 +265,8 @@ impl BinlogSource {
                         let row = match row_result {
                             Ok(r) => r,
                             Err(e) => {
-                                warn!(error = %e, table = %table_meta.table_id, "Row parse error");
+                                skipped_rows += 1;
+                                warn!(error = %e, table = %table_meta.table_id, skipped_rows, "Row parse error");
                                 continue;
                             }
                         };
@@ -303,7 +305,7 @@ impl BinlogSource {
 
                 QUERY_EVENT => {
                     if let Ok(Some(EventData::QueryEvent(query))) = event.read_data() {
-                        if self.handle_query_event(&query.query(), &tx, &current_position).await? {
+                        if self.handle_query_event(&query.query(), &tx).await? {
                             return Ok(current_position);
                         }
                     }
@@ -315,6 +317,10 @@ impl BinlogSource {
             }
         }
 
+        if skipped_rows > 0 {
+            warn!(skipped_rows, "Binlog reader finished with skipped rows");
+        }
+
         Ok(current_position)
     }
 
@@ -324,7 +330,6 @@ impl BinlogSource {
         &mut self,
         sql: &str,
         tx: &tokio::sync::mpsc::Sender<PipelineMessage>,
-        _current_position: &BinlogPosition,
     ) -> Result<bool, SourceError> {
         let sql_upper = sql.to_uppercase();
 
@@ -488,9 +493,9 @@ pub fn convert_mysql_value(
                             warn!(
                                 column = %col.name,
                                 mysql_type = %col.mysql_type_raw,
-                                "Non-UTF-8 bytes in string column, storing as binary"
+                                "Non-UTF-8 bytes in string column, using lossy conversion"
                             );
-                            Ok(ColumnValue::Bytes(e.into_bytes()))
+                            Ok(ColumnValue::String(String::from_utf8_lossy(e.as_bytes()).into_owned()))
                         }
                     }
                 }

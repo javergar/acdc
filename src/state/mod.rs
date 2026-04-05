@@ -59,6 +59,12 @@ impl OffsetStore {
             Ok(result) => {
                 let bytes = result.bytes().await?;
                 let offset: BinlogOffset = serde_json::from_slice(&bytes)?;
+                if offset.version != 1 {
+                    anyhow::bail!(
+                        "Unsupported offset version {} (expected 1) — was this created by a newer ACDC?",
+                        offset.version
+                    );
+                }
                 debug!(
                     file = %offset.binlog_file,
                     position = offset.binlog_position,

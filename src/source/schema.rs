@@ -168,10 +168,19 @@ fn mysql_base_type(mysql_type: &str) -> &str {
 /// Arrow Decimal128 supports precision up to 38.
 fn parse_precision_scale(mysql_type: &str) -> (u8, i8) {
     let (p, s) = parse_precision_scale_inner(mysql_type);
-    // Clamp precision to Arrow Decimal128 max (38)
-    let p = p.min(38).max(1);
-    let s = s.min(p as i8);
-    (p, s)
+    let clamped_p = p.min(38).max(1);
+    let clamped_s = s.min(clamped_p as i8);
+    if clamped_p != p || clamped_s != s {
+        tracing::warn!(
+            mysql_type,
+            original_precision = p,
+            original_scale = s,
+            clamped_precision = clamped_p,
+            clamped_scale = clamped_s,
+            "Decimal precision/scale clamped to Arrow Decimal128 limits"
+        );
+    }
+    (clamped_p, clamped_s)
 }
 
 fn parse_precision_scale_inner(mysql_type: &str) -> (u8, i8) {

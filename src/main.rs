@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
             ctrl_c.await.ok();
         }
         info!("Shutdown signal received");
-        shutdown_clone.store(true, Ordering::Relaxed);
+        shutdown_clone.store(true, Ordering::Release);
     });
 
     // Shared sequence counter
@@ -430,7 +430,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Acquire) {
             info!(
                 total_events = sequence.load(Ordering::Relaxed),
                 uptime_secs = start_time.elapsed().as_secs(),
