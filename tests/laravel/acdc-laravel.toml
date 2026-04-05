@@ -1,0 +1,36 @@
+[source]
+host = "127.0.0.1"
+port = 3306
+user = "cdc_user"
+password = "cdc_password"
+server_id = 200
+database = "laravel_app"
+tables = ["users", "teams", "products", "orders", "order_items", "notifications", "activity_log"]
+mode = "full_load_then_cdc"
+snapshot_chunk_size = 1000
+
+[sink]
+mode = "iceberg"
+output_dir = "./output"
+warehouse = "s3://acdc-warehouse/iceberg"
+catalog_uri = "http://localhost:8181/api/catalog"
+catalog_name = "acdc"
+namespace = "cdc"
+region = "us-east-1"
+endpoint = "http://localhost:9000"
+access_key_id = "acdc_root"
+secret_access_key = "acdc_password"
+credential = "root:s3cr3t"
+allow_http = true
+
+[sink.writer]
+batch_size = 10000
+flush_interval_secs = 10
+
+[state]
+
+[observability]
+log_level = "info"
+json_logs = false
+health_check_bind = "0.0.0.0:8080"
+stats_interval_secs = 10
