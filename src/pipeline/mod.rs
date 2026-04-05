@@ -78,9 +78,6 @@ column_builder! {
 }
 
 /// Rescale a decimal mantissa from `source_scale` to `target_scale`.
-/// E.g. mantissa=1234, source_scale=2 (12.34), target_scale=4 → 12340000? No:
-/// 1234 at scale 2 = 12.34, at scale 4 needs mantissa 123400.
-/// Rescale a decimal mantissa from `source_scale` to `target_scale`.
 /// Returns `None` on overflow (e.g. large mantissa × large power of 10).
 fn rescale_decimal(mantissa: i128, source_scale: i8, target_scale: i8) -> Option<i128> {
     let diff = target_scale as i32 - source_scale as i32;
@@ -122,7 +119,12 @@ impl ColumnBuilder {
             DataType::Decimal128(p, s) => {
                 Self::Decimal128 {
                     builder: Decimal128Builder::with_capacity(capacity)
-                        .with_precision_and_scale(*p, *s).unwrap(),
+                        .with_precision_and_scale(*p, *s)
+                        .unwrap_or_else(|e| {
+                            warn!(precision = p, scale = s, error = %e, "Invalid Decimal128 precision/scale, using defaults");
+                            Decimal128Builder::with_capacity(capacity)
+                                .with_precision_and_scale(38, 0).unwrap()
+                        }),
                     scale: *s,
                 }
             }
@@ -397,22 +399,26 @@ impl TableBuffer {
             builder.append(value, col_name);
         }
 
-        // Append CDC metadata columns
+        // Append CDC metadata columns — these must match the schema exactly.
         // _cdc_op
-        if let ColumnBuilder::Utf8(b) = &mut self.builders[num_user_cols] {
-            b.append_value(event.op.as_str());
+        match &mut self.builders[num_user_cols] {
+            ColumnBuilder::Utf8(b) => b.append_value(event.op.as_str()),
+            other => { warn!(builder_type = other.type_name(), "BUG: _cdc_op builder is not Utf8"); other.append_null_untyped(); }
         }
         // _cdc_ts
-        if let ColumnBuilder::TimestampMicro(b) = &mut self.builders[num_user_cols + 1] {
-            b.append_value(event.timestamp.timestamp_micros());
+        match &mut self.builders[num_user_cols + 1] {
+            ColumnBuilder::TimestampMicro(b) => b.append_value(event.timestamp.timestamp_micros()),
+            other => { warn!(builder_type = other.type_name(), "BUG: _cdc_ts builder is not TimestampMicro"); other.append_null_untyped(); }
         }
         // _cdc_seq
-        if let ColumnBuilder::Int64(b) = &mut self.builders[num_user_cols + 2] {
-            b.append_value(event.sequence);
+        match &mut self.builders[num_user_cols + 2] {
+            ColumnBuilder::Int64(b) => b.append_value(event.sequence),
+            other => { warn!(builder_type = other.type_name(), "BUG: _cdc_seq builder is not Int64"); other.append_null_untyped(); }
         }
         // _cdc_schema_version
-        if let ColumnBuilder::Int64(b) = &mut self.builders[num_user_cols + 3] {
-            b.append_value(self.schema_version as i64);
+        match &mut self.builders[num_user_cols + 3] {
+            ColumnBuilder::Int64(b) => b.append_value(self.schema_version as i64),
+            other => { warn!(builder_type = other.type_name(), "BUG: _cdc_schema_version builder is not Int64"); other.append_null_untyped(); }
         }
 
         self.row_count += 1;

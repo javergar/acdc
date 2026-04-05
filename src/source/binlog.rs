@@ -195,13 +195,17 @@ impl BinlogSource {
                         // Only cache if this is a tracked table
                         if let Some(meta) = self.tracked_tables.get(&table) {
                             if meta.table_id.database == db {
+                                // Evict any previous table_id mapping for this table
+                                // (binlog table_ids can be reassigned after DDL)
+                                self.table_map.retain(|_, m| m.table_id.table != table);
                                 self.table_map.insert(table_id, Arc::clone(meta));
                             }
                         }
 
                         trace!(
                             table_id = table_id,
-                            table = %format!("{}.{}", db, table),
+                            db = %db,
+                            table = %table,
                             "TableMapEvent"
                         );
                     }
@@ -495,6 +499,8 @@ pub fn convert_mysql_value(
 
         Value::Int(i) => {
             if col.col_type.is_unsigned() {
+                // MySQL sends unsigned values via the signed Int wire type.
+                // Reinterpret the bits as unsigned (e.g. -1i64 → u64::MAX).
                 Ok(ColumnValue::UInt(i as u64))
             } else {
                 Ok(ColumnValue::Int(i))
@@ -620,14 +626,19 @@ fn jsonb_object_to_serde_json<T: jsonb::StorageFormat>(
     Ok(serde_json::Value::Object(map))
 }
 
-/// Get the current master binlog position.
+/// Get the current binlog position.
+/// Uses SHOW BINARY LOG STATUS (MySQL 8.2+), falls back to SHOW MASTER STATUS (deprecated in 8.0.22, removed in 8.4).
 pub async fn get_master_status(conn: &mut mysql_async::Conn) -> Result<(String, u64), SourceError> {
-    let row: Option<mysql_async::Row> = conn
-        .query_first("SHOW MASTER STATUS")
-        .await?;
+    let row: Option<mysql_async::Row> = match conn
+        .query_first("SHOW BINARY LOG STATUS")
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => conn.query_first("SHOW MASTER STATUS").await?,
+    };
 
     let row = row.ok_or_else(|| {
-        SourceError::BinlogParse("SHOW MASTER STATUS returned no rows — is binlog enabled?".into())
+        SourceError::BinlogParse("SHOW BINARY LOG STATUS returned no rows — is binlog enabled?".into())
     })?;
 
     let filename: String = row.get(0).ok_or_else(|| {
@@ -643,6 +654,7 @@ pub async fn get_master_status(conn: &mut mysql_async::Conn) -> Result<(String, 
 
 /// Parse the table name from an ALTER TABLE SQL statement (uppercased).
 /// Handles: ALTER TABLE tablename, ALTER TABLE `tablename`, ALTER TABLE db.tablename
+/// Note: operates on uppercased SQL then lowercases result — not round-trip safe for non-ASCII table names.
 fn parse_alter_table_name(sql_upper: &str, _default_db: &str) -> Option<String> {
     let idx = sql_upper.find("ALTER TABLE")?;
     let after = &sql_upper[idx + "ALTER TABLE".len()..];

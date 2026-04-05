@@ -38,6 +38,8 @@ pub struct SourceConfig {
     pub tables: Vec<String>,
     #[serde(default = "default_source_mode")]
     pub mode: SourceMode,
+    #[serde(default = "default_snapshot_chunk_size")]
+    pub snapshot_chunk_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -134,6 +136,10 @@ pub struct ObservabilityConfig {
 
 fn default_source_mode() -> SourceMode {
     SourceMode::CdcOnly
+}
+
+fn default_snapshot_chunk_size() -> usize {
+    5000
 }
 
 fn default_batch_size() -> usize {

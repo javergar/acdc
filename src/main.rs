@@ -190,12 +190,20 @@ async fn main() -> anyhow::Result<()> {
                 sequence.clone(),
             );
 
+            // Track per-table snapshot completion for crash recovery
+            let completed_tables: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let completed_for_callback = completed_tables.clone();
+
             let (snap_tx, mut snap_rx) = tokio::sync::mpsc::channel::<PipelineMessage>(1024);
             let shutdown_snap = shutdown.clone();
             let snap_handle = tokio::spawn(async move {
-                snapshot_reader.run(&snap_tx, &shutdown_snap).await
+                snapshot_reader.run(&snap_tx, &shutdown_snap, |table_name| {
+                    completed_for_callback.lock().unwrap_or_else(|e| e.into_inner())
+                        .push(table_name.to_string());
+                }).await
             });
 
+            let mut last_saved_count = 0usize;
             while let Some(msg) = snap_rx.recv().await {
                 match msg {
                     PipelineMessage::Event(event) => {
@@ -206,6 +214,33 @@ async fn main() -> anyhow::Result<()> {
                     PipelineMessage::SchemaChange { table, new_schema } => {
                         pipeline.update_schema(&table, new_schema);
                     }
+                }
+
+                // Save per-table snapshot progress when a new table completes
+                let done = completed_tables.lock().unwrap_or_else(|e| e.into_inner());
+                let done_count = done.len();
+                if done_count > last_saved_count {
+                    let done_tables = done.clone();
+                    drop(done); // release lock before async work
+                    // Flush buffered data for completed table
+                    let batches = pipeline.flush_all();
+                    for (table_id, batch) in &batches {
+                        writer.write_batch(&table_id.table, batch).await?;
+                    }
+                    if let Some(ref store) = offset_store {
+                        let mut offset = BinlogOffset::new(
+                            String::new(), // binlog position not meaningful mid-snapshot
+                            0,
+                            sequence.load(Ordering::Relaxed),
+                        );
+                        for t in &done_tables {
+                            offset.snapshot_complete.insert(t.clone(), true);
+                        }
+                        if let Err(e) = store.save(&offset).await {
+                            warn!(error = %e, "Failed to save snapshot progress");
+                        }
+                    }
+                    last_saved_count = done_count;
                 }
             }
 
@@ -223,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
                 "Snapshot complete, switching to CDC"
             );
 
-            // Save offset after snapshot
+            // Save final offset after snapshot with binlog position
             if let Some(ref store) = offset_store {
                 let mut offset = BinlogOffset::new(
                     binlog_pos.filename.clone(),
@@ -255,15 +290,15 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Track snapshot completion state for periodic offset saves
-    let snapshot_state: HashMap<String, bool> = if (snapshot_already_done
+    // Track snapshot completion state for periodic offset saves (Arc to avoid clone per save)
+    let snapshot_state: Arc<HashMap<String, bool>> = Arc::new(if (snapshot_already_done
         || matches!(binlog_start_pos, Some(_)))
         && matches!(config.source.mode, SourceMode::FullLoadThenCdc)
     {
         config.source.tables.iter().map(|t| (t.clone(), true)).collect()
     } else {
         HashMap::new()
-    };
+    });
 
     // --- CDC phase ---
     drop(_snapshot_span);
@@ -386,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
                             pos.position,
                             sequence.load(Ordering::Relaxed),
                         );
-                        offset.snapshot_complete = snapshot_state.clone();
+                        offset.snapshot_complete = (*snapshot_state).clone();
                         if let Err(e) = store.save(&offset).await {
                             warn!(error = %e, "Failed to save periodic offset");
                         }
@@ -445,7 +480,7 @@ async fn main() -> anyhow::Result<()> {
                 pos.position,
                 sequence.load(Ordering::Relaxed),
             );
-            offset.snapshot_complete = snapshot_state.clone();
+            offset.snapshot_complete = (*snapshot_state).clone();
             if let Err(e) = store.save(&offset).await {
                 error!(error = %e, "Failed to save final offset");
             } else {

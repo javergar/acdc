@@ -42,10 +42,13 @@ impl SnapshotReader {
     ///
     /// All rows are sent through `tx` as CdcEvent with op=Snapshot.
     /// The returned BinlogPosition should be used to start the binlog stream.
+    /// `on_table_complete` is called after each table finishes so the caller
+    /// can persist per-table progress for crash recovery.
     pub async fn run(
         &self,
         tx: &tokio::sync::mpsc::Sender<PipelineMessage>,
         shutdown: &AtomicBool,
+        mut on_table_complete: impl FnMut(&str),
     ) -> Result<BinlogPosition, SourceError> {
         let mut conn = self.pool.get_conn().await?;
 
@@ -76,6 +79,7 @@ impl SnapshotReader {
 
             self.snapshot_table(&mut conn, table_meta, tx, shutdown, snapshot_ts)
                 .await?;
+            on_table_complete(&table_meta.table_id.table);
         }
 
         // 4. Commit and release the connection
@@ -107,7 +111,7 @@ impl SnapshotReader {
         let pk_cols = &table_meta.primary_key_columns;
 
         let mut total_rows: u64 = 0;
-        let chunk_size = 5000;
+        let chunk_size = self.config.snapshot_chunk_size;
 
         info!(table, pk_columns = ?pk_cols, chunk_size, "Starting snapshot for table");
 

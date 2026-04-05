@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -14,7 +13,6 @@ pub struct HealthState {
     pub binlog_position: u64,
     pub last_flush_at: Option<chrono::DateTime<chrono::Utc>>,
     pub tables: Vec<String>,
-    pub buffer_sizes: HashMap<String, usize>,
     pub started_at: Instant,
     pub events_processed: u64,
 }
@@ -26,7 +24,6 @@ impl HealthState {
             binlog_position: 0,
             last_flush_at: None,
             tables,
-            buffer_sizes: HashMap::new(),
             started_at: Instant::now(),
             events_processed: 0,
         }
@@ -103,7 +100,6 @@ async fn handle_health_connection(
         "binlog_position": state.binlog_position,
         "last_flush_at": state.last_flush_at.map(|t| t.to_rfc3339()),
         "tables": state.tables,
-        "buffer_sizes": state.buffer_sizes,
         "uptime_secs": uptime,
         "events_processed": state.events_processed,
     });
