@@ -489,14 +489,7 @@ pub fn convert_mysql_value(
                     // String-like types (varchar, text, char, enum, set, etc.)
                     match String::from_utf8(bytes) {
                         Ok(s) => Ok(ColumnValue::String(s)),
-                        Err(e) => {
-                            warn!(
-                                column = %col.name,
-                                mysql_type = %col.mysql_type_raw,
-                                "Non-UTF-8 bytes in string column, using lossy conversion"
-                            );
-                            Ok(ColumnValue::String(String::from_utf8_lossy(e.as_bytes()).into_owned()))
-                        }
+                        Err(_) => Err(utf8_err(col)),
                     }
                 }
             }

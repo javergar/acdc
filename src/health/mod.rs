@@ -100,7 +100,9 @@ async fn handle_health_connection(
             let since_flush = chrono::Utc::now() - last;
             since_flush.to_std().unwrap_or_default() < stale_threshold
         }
-        None => state.started_at.elapsed() < stale_threshold,
+        // No flush yet — healthy if events_processed is 0 (idle/starting up),
+        // stale if we've ingested events but never flushed them
+        None => state.events_processed == 0 || state.started_at.elapsed() < stale_threshold,
     };
 
     let status_code = if is_healthy { 200 } else { 503 };

@@ -349,12 +349,14 @@ async fn main() -> anyhow::Result<()> {
             msg = rx.recv() => {
                 match msg {
                     Some(PipelineMessage::Event(event)) => {
+                        {
+                            let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
+                            hs.events_processed += 1;
+                        }
                         if let Some((table_id, batch)) = pipeline.ingest(&event) {
-                            let rows = batch.num_rows() as u64;
                             writer.write_batch(&table_id.table, &batch).await?;
                             flush_timer.reset();
                             let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
-                            hs.events_processed += rows;
                             hs.last_flush_at = Some(chrono::Utc::now());
                         }
                     }
@@ -379,7 +381,6 @@ async fn main() -> anyhow::Result<()> {
                     }
                     info!(tables = batches.len(), rows = total_rows, "Timer flush");
                     let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
-                    hs.events_processed += total_rows;
                     hs.last_flush_at = Some(chrono::Utc::now());
                 } else {
                     debug!("Flush tick — no buffered data");
@@ -441,6 +442,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --- Graceful shutdown ---
+
+    // 0. Drain any remaining events from the channel
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            PipelineMessage::Event(event) => { pipeline.ingest(&event); }
+            PipelineMessage::SchemaChange { ref table, ref new_schema } => {
+                let _ = pipeline.handle_schema_change(table, new_schema.clone());
+            }
+        }
+    }
 
     // 1. Final flush of all buffers
     let batches = pipeline.flush_all();

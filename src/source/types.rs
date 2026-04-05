@@ -171,7 +171,8 @@ pub struct ColumnMeta {
     #[allow(dead_code)]
     pub ordinal: usize,
     pub col_type: MysqlType,
-    /// Raw MySQL type string for logging (e.g. "bigint unsigned", "decimal(10,2)")
+    /// Raw MySQL type string for debugging (e.g. "bigint unsigned", "decimal(10,2)")
+    #[allow(dead_code)]
     pub mysql_type_raw: String,
     pub nullable: bool,
 }

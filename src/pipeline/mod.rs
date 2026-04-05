@@ -227,9 +227,11 @@ impl ColumnBuilder {
             (Self::Float32(b), ColumnValue::Float(v)) => {
                 let f = *v as f32;
                 if f.is_infinite() && !v.is_infinite() {
-                    warn!(column = col_name, value = v, "Float64→Float32 overflow to infinity");
+                    warn!(column = col_name, value = v, "Float64→Float32 overflow, writing NULL");
+                    b.append_null();
+                } else {
+                    b.append_value(f);
                 }
-                b.append_value(f);
             }
             (Self::Float64(b), ColumnValue::Float(v)) => b.append_value(*v),
 
@@ -262,7 +264,7 @@ impl ColumnBuilder {
                 match 10i128.checked_pow(*scale as u32).and_then(|f| (*v as i128).checked_mul(f)) {
                     Some(val) => b.append_value(val),
                     None => {
-                        warn!(column = col_name, "Decimal overflow, writing NULL");
+                        warn!(column = col_name, value = v, scale = *scale, "Decimal overflow, writing NULL");
                         b.append_null();
                     }
                 }
@@ -271,7 +273,7 @@ impl ColumnBuilder {
                 match 10i128.checked_pow(*scale as u32).and_then(|f| (*v as i128).checked_mul(f)) {
                     Some(val) => b.append_value(val),
                     None => {
-                        warn!(column = col_name, "Decimal overflow, writing NULL");
+                        warn!(column = col_name, value = v, scale = *scale, "Decimal overflow, writing NULL");
                         b.append_null();
                     }
                 }

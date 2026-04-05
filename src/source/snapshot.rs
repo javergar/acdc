@@ -145,7 +145,7 @@ impl SnapshotReader {
                         "SELECT {} FROM `{}`.`{}` ORDER BY `{}` LIMIT {}",
                         select_cols, db, table, pk, chunk_size
                     ),
-                    Some(_val) => format!(
+                    Some(_) => format!(
                         "SELECT {} FROM `{}`.`{}` WHERE `{}` > :last_pk ORDER BY `{}` LIMIT {}",
                         select_cols, db, table, pk, pk, chunk_size
                     ),
