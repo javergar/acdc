@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::config::SinkConfig;
+use crate::error::retry;
 
 /// Persisted binlog offset for crash recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,9 +78,19 @@ impl OffsetStore {
     /// Save the offset. Called AFTER successful Iceberg commit.
     pub async fn save(&self, offset: &BinlogOffset) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(offset)?;
-        self.store
-            .put(&self.path, Bytes::from(json).into())
-            .await?;
+        let payload = Bytes::from(json);
+        let store = self.store.clone();
+        let path = self.path.clone();
+        retry("offset_save", 3, || {
+            let store = store.clone();
+            let path = path.clone();
+            let payload = payload.clone();
+            async move {
+                store.put(&path, payload.into()).await?;
+                Ok(())
+            }
+        })
+        .await?;
         info!(
             file = %offset.binlog_file,
             position = offset.binlog_position,
@@ -87,5 +98,33 @@ impl OffsetStore {
             "Saved offset"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offset_roundtrip() {
+        let mut offset = BinlogOffset::new(
+            "mysql-bin.000003".to_string(),
+            12345,
+            42,
+        );
+        offset.snapshot_complete.insert("orders".to_string(), true);
+        offset.snapshot_complete.insert("customers".to_string(), true);
+        offset.gtid_set = Some("abc-123:1-10".to_string());
+
+        let json = serde_json::to_string(&offset).unwrap();
+        let deserialized: BinlogOffset = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.version, 1);
+        assert_eq!(deserialized.binlog_file, "mysql-bin.000003");
+        assert_eq!(deserialized.binlog_position, 12345);
+        assert_eq!(deserialized.cdc_seq, 42);
+        assert_eq!(deserialized.gtid_set.as_deref(), Some("abc-123:1-10"));
+        assert_eq!(deserialized.snapshot_complete.len(), 2);
+        assert_eq!(deserialized.snapshot_complete.get("orders"), Some(&true));
     }
 }

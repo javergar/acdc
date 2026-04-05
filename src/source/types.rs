@@ -36,11 +36,49 @@ impl std::fmt::Display for TableId {
     }
 }
 
+/// Structured error for value conversion failures.
+#[derive(Debug)]
+pub enum ConversionError {
+    InvalidUtf8 { column: String },
+    InvalidDate { column: String, raw: String },
+    ParseError { column: String, target: &'static str, raw: String },
+    UnsupportedJsonDiff,
+    #[allow(dead_code)]
+    Overflow { column: String, value: String },
+}
+
+impl std::fmt::Display for ConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUtf8 { column } => write!(f, "Invalid UTF-8 in column '{}'", column),
+            Self::InvalidDate { column, raw } => {
+                write!(f, "Invalid date '{}' in column '{}'", raw, column)
+            }
+            Self::ParseError { column, target, raw } => {
+                write!(f, "Failed to parse '{}' as {} in column '{}'", raw, target, column)
+            }
+            Self::UnsupportedJsonDiff => write!(f, "JsonDiff not yet supported"),
+            Self::Overflow { column, value } => {
+                write!(f, "Overflow converting '{}' in column '{}'", value, column)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConversionError {}
+
+/// Signed microseconds for MySQL TIME values (can be negative: -838:59:59 to 838:59:59).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TimeMicroseconds(pub i64);
+
 /// A single column value extracted from a binlog row or snapshot query.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ColumnValue {
     Null,
+    /// Conversion failed — treated as NULL in Arrow, but reason preserved for logging.
+    ConversionFailed(String),
+    #[allow(dead_code)]
     Bool(bool),
     Int(i64),
     UInt(u64),
@@ -51,7 +89,7 @@ pub enum ColumnValue {
     Date(chrono::NaiveDate),
     DateTime(chrono::NaiveDateTime),
     /// TIME as signed microseconds (MySQL TIME can be negative)
-    TimeMicros(i64),
+    TimeMicros(TimeMicroseconds),
     Json(serde_json::Value),
 }
 
@@ -71,14 +109,69 @@ fn serialize_decimal<S: serde::Serializer>(
     s.serialize_str(&d.to_string())
 }
 
+/// Structured representation of a MySQL column type, parsed once at introspection time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MysqlType {
+    TinyintBool,
+    Tinyint { unsigned: bool },
+    Smallint { unsigned: bool },
+    Mediumint { unsigned: bool },
+    Int { unsigned: bool },
+    Bigint { unsigned: bool },
+    Float,
+    Double,
+    Decimal { precision: u8, scale: i8 },
+    Date,
+    DateTime,
+    Timestamp,
+    Time,
+    Year,
+    Char,
+    Varchar,
+    Text,
+    Enum,
+    Set,
+    Json,
+    Binary,
+    Varbinary,
+    Blob,
+    Bit,
+    Spatial,
+}
+
+impl MysqlType {
+    /// Whether this type is unsigned (only applies to integer types).
+    pub fn is_unsigned(&self) -> bool {
+        matches!(
+            self,
+            Self::Tinyint { unsigned: true }
+                | Self::Smallint { unsigned: true }
+                | Self::Mediumint { unsigned: true }
+                | Self::Int { unsigned: true }
+                | Self::Bigint { unsigned: true }
+        )
+    }
+
+    /// Whether this is a binary/blob type (raw bytes, not text).
+    #[allow(dead_code)]
+    pub fn is_binary(&self) -> bool {
+        matches!(
+            self,
+            Self::Binary | Self::Varbinary | Self::Blob | Self::Bit | Self::Spatial
+        )
+    }
+}
+
 /// Metadata about a single column in a MySQL table.
 #[derive(Debug, Clone)]
 pub struct ColumnMeta {
     pub name: String,
+    #[allow(dead_code)]
     pub ordinal: usize,
-    pub mysql_type: String,
+    pub col_type: MysqlType,
+    /// Raw MySQL type string for logging (e.g. "bigint unsigned", "decimal(10,2)")
+    pub mysql_type_raw: String,
     pub nullable: bool,
-    pub is_unsigned: bool,
 }
 
 /// A CDC event representing a single row change.
@@ -88,8 +181,8 @@ pub struct CdcEvent {
     pub op: CdcOp,
     pub timestamp: DateTime<Utc>,
     pub sequence: i64,
-    /// Column name → value pairs (after-image for INSERT/UPDATE, full row for DELETE)
-    pub columns: Vec<(String, ColumnValue)>,
+    /// Column values in ordinal order (names come from the table schema, not repeated per row)
+    pub values: Vec<ColumnValue>,
 }
 
 /// Message sent through the pipeline channel.

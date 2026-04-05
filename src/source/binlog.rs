@@ -14,7 +14,7 @@ use mysql_async::Pool;
 use tracing::{debug, trace, warn};
 
 use super::schema::TableMeta;
-use super::types::{CdcEvent, CdcOp, ColumnMeta, ColumnValue, PipelineMessage, TableId};
+use super::types::{CdcEvent, CdcOp, ColumnMeta, ColumnValue, ConversionError, PipelineMessage, TableId};
 use super::SourceError;
 use crate::config::SourceConfig;
 
@@ -31,11 +31,11 @@ pub struct BinlogSource {
     pool: Pool,
     config: SourceConfig,
     /// binlog table_id → TableMeta (populated from TableMapEvent + introspection)
-    table_map: HashMap<u64, TableMeta>,
+    table_map: HashMap<u64, Arc<TableMeta>>,
     /// Monotonically increasing sequence counter
     sequence: Arc<AtomicI64>,
     /// Tables we're interested in (from config)
-    tracked_tables: HashMap<String, TableMeta>,
+    tracked_tables: HashMap<String, Arc<TableMeta>>,
     /// Shared current position — read by main for periodic offset saves
     shared_position: Arc<std::sync::Mutex<BinlogPosition>>,
 }
@@ -48,9 +48,9 @@ impl BinlogSource {
         sequence: Arc<AtomicI64>,
         shared_position: Arc<std::sync::Mutex<BinlogPosition>>,
     ) -> Result<Self, SourceError> {
-        let tracked_tables: HashMap<String, TableMeta> = tables
+        let tracked_tables: HashMap<String, Arc<TableMeta>> = tables
             .into_iter()
-            .map(|t| (t.table_id.table.clone(), t))
+            .map(|t| (t.table_id.table.clone(), Arc::new(t)))
             .collect();
 
         Ok(Self {
@@ -63,9 +63,8 @@ impl BinlogSource {
         })
     }
 
-    /// Start streaming binlog events. Sends CdcEvents through the channel.
-    /// Runs until shutdown is signaled or the channel is closed.
     /// Start streaming binlog events from a given position (or current master position).
+    /// Runs until shutdown is signaled or the channel is closed.
     pub async fn stream(
         &mut self,
         tx: tokio::sync::mpsc::Sender<PipelineMessage>,
@@ -164,11 +163,9 @@ impl BinlogSource {
                         let table_id = tme.table_id();
 
                         // Only cache if this is a tracked table
-                        if self.tracked_tables.contains_key(&table) {
-                            if let Some(meta) = self.tracked_tables.get(&table) {
-                                if meta.table_id.database == db {
-                                    self.table_map.insert(table_id, meta.clone());
-                                }
+                        if let Some(meta) = self.tracked_tables.get(&table) {
+                            if meta.table_id.database == db {
+                                self.table_map.insert(table_id, Arc::clone(meta));
                             }
                         }
 
@@ -260,7 +257,7 @@ impl BinlogSource {
                             op,
                             timestamp: event_timestamp,
                             sequence: seq,
-                            columns,
+                            values: columns,
                         };
 
                         if tx.send(PipelineMessage::Event(cdc_event)).await.is_err() {
@@ -272,45 +269,8 @@ impl BinlogSource {
 
                 QUERY_EVENT => {
                     if let Ok(Some(EventData::QueryEvent(query))) = event.read_data() {
-                        let sql = query.query();
-                        let sql_upper = sql.to_uppercase();
-
-                        if sql_upper.contains("ALTER TABLE") {
-                            tracing::info!(sql = %sql, "ALTER TABLE detected, evolving schema");
-
-                            if let Some(table_name) = parse_alter_table_name(&sql_upper, &self.config.database) {
-                                if self.tracked_tables.contains_key(&table_name) {
-                                    match super::schema::introspect_table(
-                                        &self.pool, &self.config.database, &table_name
-                                    ).await {
-                                        Ok(new_meta) => {
-                                            tracing::info!(
-                                                table = %table_name,
-                                                columns = new_meta.columns.len(),
-                                                "Schema re-introspected after ALTER TABLE"
-                                            );
-                                            self.tracked_tables.insert(table_name.clone(), new_meta.clone());
-                                            self.table_map.retain(|_, meta| meta.table_id.table != table_name);
-
-                                            // Send typed schema change signal
-                                            let msg = PipelineMessage::SchemaChange {
-                                                table: new_meta.table_id.clone(),
-                                                new_schema: new_meta.arrow_schema.clone(),
-                                            };
-                                            if tx.send(msg).await.is_err() {
-                                                return Ok(current_position);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!(table = %table_name, error = %e, "Failed to re-introspect after ALTER TABLE");
-                                        }
-                                    }
-                                }
-                            } else {
-                                warn!(sql = %sql, "Could not parse table name from ALTER TABLE");
-                            }
-                        } else if sql_upper.contains("DROP TABLE") || sql_upper.contains("CREATE TABLE") {
-                            warn!(sql = %sql, "DDL detected (non-ALTER)");
+                        if self.handle_query_event(&query.query(), &tx, &current_position).await? {
+                            return Ok(current_position);
                         }
                     }
                 }
@@ -323,6 +283,57 @@ impl BinlogSource {
 
         Ok(current_position)
     }
+
+    /// Handle a QUERY_EVENT — detect DDL and re-introspect schema.
+    /// Returns `Ok(true)` if the channel closed (caller should return).
+    async fn handle_query_event(
+        &mut self,
+        sql: &str,
+        tx: &tokio::sync::mpsc::Sender<PipelineMessage>,
+        _current_position: &BinlogPosition,
+    ) -> Result<bool, SourceError> {
+        let sql_upper = sql.to_uppercase();
+
+        if sql_upper.contains("ALTER TABLE") {
+            tracing::info!(sql = %sql, "ALTER TABLE detected, evolving schema");
+
+            if let Some(table_name) = parse_alter_table_name(&sql_upper, &self.config.database) {
+                if self.tracked_tables.contains_key(&table_name) {
+                    match super::schema::introspect_table(
+                        &self.pool, &self.config.database, &table_name
+                    ).await {
+                        Ok(new_meta) => {
+                            tracing::info!(
+                                table = %table_name,
+                                columns = new_meta.columns.len(),
+                                "Schema re-introspected after ALTER TABLE"
+                            );
+                            let new_meta = Arc::new(new_meta);
+                            self.tracked_tables.insert(table_name.clone(), Arc::clone(&new_meta));
+                            self.table_map.retain(|_, meta| meta.table_id.table != table_name);
+
+                            let msg = PipelineMessage::SchemaChange {
+                                table: new_meta.table_id.clone(),
+                                new_schema: new_meta.arrow_schema.clone(),
+                            };
+                            if tx.send(msg).await.is_err() {
+                                return Ok(true); // channel closed
+                            }
+                        }
+                        Err(e) => {
+                            warn!(table = %table_name, error = %e, "Failed to re-introspect after ALTER TABLE");
+                        }
+                    }
+                }
+            } else {
+                warn!(sql = %sql, "Could not parse table name from ALTER TABLE");
+            }
+        } else if sql_upper.contains("DROP TABLE") || sql_upper.contains("CREATE TABLE") {
+            warn!(sql = %sql, "DDL detected (non-ALTER)");
+        }
+
+        Ok(false)
+    }
 }
 
 /// Convert a BinlogRow into a vector of (column_name, ColumnValue) pairs.
@@ -330,7 +341,7 @@ fn convert_binlog_row(
     mut row: BinlogRow,
     columns: &[ColumnMeta],
     table_id: &TableId,
-) -> Vec<(String, ColumnValue)> {
+) -> Vec<ColumnValue> {
     let mut result = Vec::with_capacity(columns.len());
 
     for (i, col) in columns.iter().enumerate() {
@@ -342,12 +353,12 @@ fn convert_binlog_row(
                     table = %table_id,
                     column = %col.name,
                     error = %e,
-                    "Column conversion error, writing NULL"
+                    "Column conversion error"
                 );
-                ColumnValue::Null
+                ColumnValue::ConversionFailed(e.to_string())
             }
         };
-        result.push((col.name.clone(), converted));
+        result.push(converted);
     }
 
     result
@@ -357,7 +368,7 @@ fn convert_binlog_row(
 fn convert_binlog_value(
     value: Option<BinlogValue<'_>>,
     col: &ColumnMeta,
-) -> Result<ColumnValue, String> {
+) -> Result<ColumnValue, ConversionError> {
     let bv = match value {
         None => return Ok(ColumnValue::Null),
         Some(v) => v,
@@ -366,65 +377,73 @@ fn convert_binlog_value(
     match bv {
         BinlogValue::Value(v) => convert_mysql_value(v, col),
         BinlogValue::Jsonb(v) => {
-            let json = jsonb_to_serde_json(v)?;
+            let json = jsonb_to_serde_json(v).map_err(|e| parse_err(col, "jsonb", e))?;
             Ok(ColumnValue::Json(json))
         }
-        BinlogValue::JsonDiff(_) => {
-            // JsonDiff is a partial update — rare in practice.
-            // Log a warning and return null for now.
-            Err("JsonDiff not yet supported".to_string())
-        }
+        BinlogValue::JsonDiff(_) => Err(ConversionError::UnsupportedJsonDiff),
     }
+}
+
+/// Helper to create a parse error for the given column.
+fn parse_err(col: &ColumnMeta, target: &'static str, e: impl std::fmt::Display) -> ConversionError {
+    ConversionError::ParseError {
+        column: col.name.clone(),
+        target,
+        raw: e.to_string(),
+    }
+}
+
+fn utf8_err(col: &ColumnMeta) -> ConversionError {
+    ConversionError::InvalidUtf8 { column: col.name.clone() }
 }
 
 /// Convert a mysql_common::Value to our ColumnValue.
 pub fn convert_mysql_value(
     value: mysql_common::value::Value,
     col: &ColumnMeta,
-) -> Result<ColumnValue, String> {
+) -> Result<ColumnValue, ConversionError> {
     use mysql_common::value::Value;
+    use super::types::MysqlType;
 
     match value {
         Value::NULL => Ok(ColumnValue::Null),
 
         Value::Bytes(bytes) => {
-            let base_type = mysql_base_type(&col.mysql_type);
-            match base_type {
-                "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
-                | "bit" | "point" | "linestring" | "polygon" | "geometry" | "multipoint"
-                | "multilinestring" | "multipolygon" | "geomcollection"
-                | "geometrycollection" => Ok(ColumnValue::Bytes(bytes)),
-                "json" => {
-                    let s = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+            match &col.col_type {
+                MysqlType::Binary | MysqlType::Varbinary | MysqlType::Blob
+                | MysqlType::Bit | MysqlType::Spatial => Ok(ColumnValue::Bytes(bytes)),
+                MysqlType::Json => {
+                    let s = String::from_utf8(bytes).map_err(|_| utf8_err(col))?;
                     let json: serde_json::Value =
-                        serde_json::from_str(&s).map_err(|e| e.to_string())?;
+                        serde_json::from_str(&s).map_err(|e| parse_err(col, "json", e))?;
                     Ok(ColumnValue::Json(json))
                 }
-                "decimal" | "numeric" => {
-                    let s = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+                MysqlType::Decimal { .. } => {
+                    let s = String::from_utf8(bytes).map_err(|_| utf8_err(col))?;
                     let d: rust_decimal::Decimal =
-                        s.parse().map_err(|e: rust_decimal::Error| e.to_string())?;
+                        s.parse().map_err(|e: rust_decimal::Error| parse_err(col, "decimal", e))?;
                     Ok(ColumnValue::Decimal(d))
                 }
                 // Integer types arriving as Bytes (common from SELECT queries)
-                "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" => {
-                    let s = String::from_utf8(bytes).map_err(|e| e.to_string())?;
-                    if col.is_unsigned {
-                        let v: u64 = s.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                MysqlType::TinyintBool | MysqlType::Tinyint { .. } | MysqlType::Smallint { .. }
+                | MysqlType::Mediumint { .. } | MysqlType::Int { .. } | MysqlType::Bigint { .. } => {
+                    let s = String::from_utf8(bytes).map_err(|_| utf8_err(col))?;
+                    if col.col_type.is_unsigned() {
+                        let v: u64 = s.parse().map_err(|e: std::num::ParseIntError| parse_err(col, "u64", e))?;
                         Ok(ColumnValue::UInt(v))
                     } else {
-                        let v: i64 = s.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                        let v: i64 = s.parse().map_err(|e: std::num::ParseIntError| parse_err(col, "i64", e))?;
                         Ok(ColumnValue::Int(v))
                     }
                 }
-                "float" | "double" | "real" => {
-                    let s = String::from_utf8(bytes).map_err(|e| e.to_string())?;
-                    let v: f64 = s.parse().map_err(|e: std::num::ParseFloatError| e.to_string())?;
+                MysqlType::Float | MysqlType::Double => {
+                    let s = String::from_utf8(bytes).map_err(|_| utf8_err(col))?;
+                    let v: f64 = s.parse().map_err(|e: std::num::ParseFloatError| parse_err(col, "f64", e))?;
                     Ok(ColumnValue::Float(v))
                 }
-                "year" => {
-                    let s = String::from_utf8(bytes).map_err(|e| e.to_string())?;
-                    let v: i64 = s.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                MysqlType::Year => {
+                    let s = String::from_utf8(bytes).map_err(|_| utf8_err(col))?;
+                    let v: i64 = s.parse().map_err(|e: std::num::ParseIntError| parse_err(col, "year", e))?;
                     Ok(ColumnValue::Int(v))
                 }
                 _ => {
@@ -434,7 +453,7 @@ pub fn convert_mysql_value(
                         Err(e) => {
                             warn!(
                                 column = %col.name,
-                                mysql_type = %col.mysql_type,
+                                mysql_type = %col.mysql_type_raw,
                                 "Non-UTF-8 bytes in string column, storing as binary"
                             );
                             Ok(ColumnValue::Bytes(e.into_bytes()))
@@ -445,8 +464,7 @@ pub fn convert_mysql_value(
         }
 
         Value::Int(i) => {
-            if col.is_unsigned {
-                // Value::Int stores i64; reinterpret as unsigned
+            if col.col_type.is_unsigned() {
                 Ok(ColumnValue::UInt(i as u64))
             } else {
                 Ok(ColumnValue::Int(i))
@@ -454,8 +472,6 @@ pub fn convert_mysql_value(
         }
 
         Value::UInt(u) => {
-            // BIGINT UNSIGNED: values > i64::MAX will be truncated when stored in Int64 Arrow.
-            // Log a warning for values that exceed i64::MAX.
             if u > i64::MAX as u64 {
                 warn!(
                     column = %col.name,
@@ -470,69 +486,48 @@ pub fn convert_mysql_value(
         Value::Double(f) => Ok(ColumnValue::Float(f)),
 
         Value::Date(year, month, day, hour, min, sec, micro) => {
-            // Handle zero dates: MySQL allows 0000-00-00 which is invalid in chrono
             if year == 0 && month == 0 && day == 0 {
                 return Ok(ColumnValue::Null);
             }
 
-            let base_type = mysql_base_type(&col.mysql_type);
-            match base_type {
-                "date" => {
+            match &col.col_type {
+                MysqlType::Date => {
                     match chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32) {
                         Some(date) => Ok(ColumnValue::Date(date)),
-                        None => {
-                            // Invalid date (e.g., Feb 30) → NULL
-                            Err(format!("Invalid date: {}-{:02}-{:02}", year, month, day))
-                        }
+                        None => Err(ConversionError::InvalidDate {
+                            column: col.name.clone(),
+                            raw: format!("{}-{:02}-{:02}", year, month, day),
+                        }),
                     }
                 }
                 _ => {
-                    // datetime, timestamp, or unknown date-like type
                     match chrono::NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32) {
                         Some(date) => {
                             let time = chrono::NaiveTime::from_hms_micro_opt(
-                                hour as u32,
-                                min as u32,
-                                sec as u32,
-                                micro,
+                                hour as u32, min as u32, sec as u32, micro,
                             )
                             .unwrap_or_default();
                             Ok(ColumnValue::DateTime(chrono::NaiveDateTime::new(date, time)))
                         }
-                        None => {
-                            // Invalid date → NULL
-                            Err(format!(
-                                "Invalid datetime: {}-{:02}-{:02} {:02}:{:02}:{:02}",
-                                year, month, day, hour, min, sec
-                            ))
-                        }
+                        None => Err(ConversionError::InvalidDate {
+                            column: col.name.clone(),
+                            raw: format!("{}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, min, sec),
+                        }),
                     }
                 }
             }
         }
 
         Value::Time(is_neg, days, hours, mins, secs, micros) => {
-            // MySQL TIME range: -838:59:59.000000 to 838:59:59.000000
-            // Arrow Duration(Microsecond) is signed i64, so we CAN represent negative values.
             let total_micros = ((days as i64) * 86_400 + (hours as i64) * 3_600
                 + (mins as i64) * 60
                 + (secs as i64))
                 * 1_000_000
                 + (micros as i64);
             let signed_micros = if is_neg { -total_micros } else { total_micros };
-            Ok(ColumnValue::TimeMicros(signed_micros))
+            Ok(ColumnValue::TimeMicros(super::types::TimeMicroseconds(signed_micros)))
         }
     }
-}
-
-/// Extract the base MySQL type name (before parentheses or "unsigned").
-fn mysql_base_type(mysql_type: &str) -> &str {
-    let s = mysql_type.trim();
-    // Find first '(' or ' '
-    let end = s
-        .find(|c: char| c == '(' || c == ' ')
-        .unwrap_or(s.len());
-    &s[..end]
 }
 
 /// Recursively convert mysql_common jsonb::Value to serde_json::Value.
@@ -618,7 +613,7 @@ pub async fn get_master_status(conn: &mut mysql_async::Conn) -> Result<(String, 
 
 /// Parse the table name from an ALTER TABLE SQL statement (uppercased).
 /// Handles: ALTER TABLE tablename, ALTER TABLE `tablename`, ALTER TABLE db.tablename
-fn parse_alter_table_name(sql_upper: &str, default_db: &str) -> Option<String> {
+fn parse_alter_table_name(sql_upper: &str, _default_db: &str) -> Option<String> {
     let idx = sql_upper.find("ALTER TABLE")?;
     let after = &sql_upper[idx + "ALTER TABLE".len()..];
     let trimmed = after.trim_start();
@@ -653,14 +648,15 @@ fn parse_alter_table_name(sql_upper: &str, default_db: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::source::types::ColumnMeta;
+    use crate::source::schema::parse_mysql_type;
 
-    fn col(name: &str, mysql_type: &str, unsigned: bool) -> ColumnMeta {
+    fn col(name: &str, mysql_type_raw: &str) -> ColumnMeta {
         ColumnMeta {
             name: name.to_string(),
             ordinal: 0,
-            mysql_type: mysql_type.to_string(),
+            col_type: parse_mysql_type(mysql_type_raw),
+            mysql_type_raw: mysql_type_raw.to_string(),
             nullable: true,
-            is_unsigned: unsigned,
         }
     }
 
@@ -703,54 +699,32 @@ mod tests {
         assert_eq!(parse_alter_table_name("SELECT 1", "testdb"), None);
     }
 
-    // --- mysql_base_type ---
-
-    #[test]
-    fn base_type_simple() {
-        assert_eq!(mysql_base_type("int"), "int");
-    }
-
-    #[test]
-    fn base_type_with_parens() {
-        assert_eq!(mysql_base_type("varchar(255)"), "varchar");
-    }
-
-    #[test]
-    fn base_type_unsigned() {
-        assert_eq!(mysql_base_type("bigint unsigned"), "bigint");
-    }
-
-    #[test]
-    fn base_type_decimal() {
-        assert_eq!(mysql_base_type("decimal(10,2)"), "decimal");
-    }
-
     // --- convert_mysql_value ---
 
     #[test]
     fn convert_null() {
-        let c = col("id", "int", false);
+        let c = col("id", "int");
         let result = convert_mysql_value(mysql_common::value::Value::NULL, &c).unwrap();
         assert!(matches!(result, ColumnValue::Null));
     }
 
     #[test]
     fn convert_int_signed() {
-        let c = col("id", "int", false);
+        let c = col("id", "int");
         let result = convert_mysql_value(mysql_common::value::Value::Int(-42), &c).unwrap();
         assert!(matches!(result, ColumnValue::Int(-42)));
     }
 
     #[test]
     fn convert_int_unsigned_flag() {
-        let c = col("id", "int unsigned", true);
+        let c = col("id", "int unsigned");
         let result = convert_mysql_value(mysql_common::value::Value::Int(42), &c).unwrap();
         assert!(matches!(result, ColumnValue::UInt(42)));
     }
 
     #[test]
     fn convert_uint_large() {
-        let c = col("id", "bigint unsigned", true);
+        let c = col("id", "bigint unsigned");
         let big = u64::MAX;
         let result = convert_mysql_value(mysql_common::value::Value::UInt(big), &c).unwrap();
         match result {
@@ -761,7 +735,7 @@ mod tests {
 
     #[test]
     fn convert_bytes_integer() {
-        let c = col("id", "int", false);
+        let c = col("id", "int");
         let result =
             convert_mysql_value(mysql_common::value::Value::Bytes(b"12345".to_vec()), &c)
                 .unwrap();
@@ -770,7 +744,7 @@ mod tests {
 
     #[test]
     fn convert_bytes_decimal() {
-        let c = col("amount", "decimal(10,2)", false);
+        let c = col("amount", "decimal(10,2)");
         let result =
             convert_mysql_value(mysql_common::value::Value::Bytes(b"123.45".to_vec()), &c)
                 .unwrap();
@@ -782,7 +756,7 @@ mod tests {
 
     #[test]
     fn convert_bytes_json() {
-        let c = col("data", "json", false);
+        let c = col("data", "json");
         let result = convert_mysql_value(
             mysql_common::value::Value::Bytes(br#"{"a":1}"#.to_vec()),
             &c,
@@ -796,7 +770,7 @@ mod tests {
 
     #[test]
     fn convert_zero_date() {
-        let c = col("d", "date", false);
+        let c = col("d", "date");
         let result =
             convert_mysql_value(mysql_common::value::Value::Date(0, 0, 0, 0, 0, 0, 0), &c)
                 .unwrap();
@@ -805,7 +779,7 @@ mod tests {
 
     #[test]
     fn convert_valid_date() {
-        let c = col("d", "date", false);
+        let c = col("d", "date");
         let result =
             convert_mysql_value(mysql_common::value::Value::Date(2024, 3, 15, 0, 0, 0, 0), &c)
                 .unwrap();
@@ -819,7 +793,7 @@ mod tests {
 
     #[test]
     fn convert_datetime() {
-        let c = col("ts", "datetime", false);
+        let c = col("ts", "datetime");
         let result = convert_mysql_value(
             mysql_common::value::Value::Date(2024, 6, 15, 10, 30, 45, 123456),
             &c,
@@ -835,14 +809,14 @@ mod tests {
 
     #[test]
     fn convert_negative_time() {
-        let c = col("t", "time", false);
+        let c = col("t", "time");
         // -01:30:00 = negative, 0 days, 1 hour, 30 min, 0 sec, 0 micro
         let result =
             convert_mysql_value(mysql_common::value::Value::Time(true, 0, 1, 30, 0, 0), &c)
                 .unwrap();
         match result {
             ColumnValue::TimeMicros(us) => {
-                assert_eq!(us, -(90 * 60 * 1_000_000)); // -1h30m in micros
+                assert_eq!(us.0, -(90 * 60 * 1_000_000)); // -1h30m in micros
             }
             _ => panic!("Expected TimeMicros"),
         }
@@ -850,7 +824,7 @@ mod tests {
 
     #[test]
     fn convert_year_bytes() {
-        let c = col("y", "year", false);
+        let c = col("y", "year");
         let result =
             convert_mysql_value(mysql_common::value::Value::Bytes(b"2024".to_vec()), &c)
                 .unwrap();
@@ -859,7 +833,7 @@ mod tests {
 
     #[test]
     fn convert_bytes_float() {
-        let c = col("f", "double", false);
+        let c = col("f", "double");
         let result =
             convert_mysql_value(mysql_common::value::Value::Bytes(b"3.14".to_vec()), &c)
                 .unwrap();
@@ -871,7 +845,7 @@ mod tests {
 
     #[test]
     fn convert_binary_bytes() {
-        let c = col("b", "blob", false);
+        let c = col("b", "blob");
         let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let result =
             convert_mysql_value(mysql_common::value::Value::Bytes(data.clone()), &c).unwrap();

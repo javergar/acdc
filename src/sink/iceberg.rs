@@ -17,6 +17,7 @@ use parquet::file::properties::WriterProperties;
 use tracing::{debug, info};
 
 use crate::config::SinkConfig;
+use crate::error::retry;
 use crate::source::schema::TableMeta;
 
 /// Iceberg sink: writes Parquet to S3, then commits data files to the Iceberg catalog.
@@ -150,8 +151,22 @@ impl IcebergSink {
                 info!(table = table_name, "Loaded existing Iceberg table");
                 self.tables.insert(table_name.to_string(), table);
             }
-            Err(_) => {
-                // Table doesn't exist, create it
+            Err(e) => {
+                // Only create if the table genuinely doesn't exist.
+                // iceberg-rust 0.4 doesn't expose typed error variants, so match on message.
+                let err_msg = e.to_string().to_lowercase();
+                if !err_msg.contains("not found")
+                    && !err_msg.contains("no such")
+                    && !err_msg.contains("does not exist")
+                    && !err_msg.contains("404")
+                {
+                    return Err(anyhow::anyhow!(
+                        "Failed to load Iceberg table '{}': {}",
+                        table_name,
+                        e
+                    ));
+                }
+
                 let arrow_schema = self
                     .schemas
                     .get(table_name)
@@ -214,9 +229,19 @@ impl IcebergSink {
         let s3_path = Path::from(relative_path.clone());
         let full_s3_uri = format!("s3://{}/{}", self.bucket, relative_path);
 
-        self.s3_store
-            .put(&s3_path, Bytes::from(buf).into())
-            .await?;
+        let payload = Bytes::from(buf);
+        let store = self.s3_store.clone();
+        let path = s3_path.clone();
+        retry("s3_put", 3, || {
+            let store = store.clone();
+            let path = path.clone();
+            let payload = payload.clone();
+            async move {
+                store.put(&path, payload.into()).await?;
+                Ok(())
+            }
+        })
+        .await?;
 
         debug!(
             table = table_name,

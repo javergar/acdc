@@ -68,7 +68,7 @@ pub async fn serve_health(
         let mut buf = [0u8; 1024];
         let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
 
-        let state = state.lock().unwrap().clone();
+        let state = state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let uptime = state.started_at.elapsed().as_secs();
 
         // Determine health status

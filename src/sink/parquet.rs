@@ -11,6 +11,7 @@ use parquet::file::properties::WriterProperties;
 use tracing::info;
 
 use crate::config::SinkConfig;
+use crate::error::retry;
 
 /// Writes RecordBatches as local Parquet files.
 pub struct LocalParquetWriter {
@@ -104,9 +105,18 @@ impl S3ParquetWriter {
         };
 
         let path = object_store::path::Path::from(s3_key.clone());
-        self.store
-            .put(&path, Bytes::from(buf).into())
-            .await?;
+        let payload = Bytes::from(buf);
+        let store = self.store.clone();
+        retry("s3_put", 3, || {
+            let store = store.clone();
+            let path = path.clone();
+            let payload = payload.clone();
+            async move {
+                store.put(&path, payload.into()).await?;
+                Ok(())
+            }
+        })
+        .await?;
 
         info!(table, rows = batch.num_rows(), path = %s3_key, size_bytes = file_size, "Wrote Parquet to S3");
         Ok(s3_key)

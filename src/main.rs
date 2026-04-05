@@ -6,6 +6,7 @@ mod sink;
 mod source;
 mod state;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, SourceMode};
+use crate::config::{Config, SinkMode, SourceMode};
 use crate::health::{serve_health, HealthState};
 use crate::pipeline::Pipeline;
 use crate::sink::iceberg::IcebergSink;
@@ -154,16 +155,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize pipeline and sink
     let mut pipeline = Pipeline::new(&tables, config.sink.writer.batch_size);
-    let mut writer = match config.sink.mode.as_str() {
-        "iceberg" => {
+    let mut writer = match config.sink.mode {
+        SinkMode::Iceberg => {
             info!("Using Iceberg sink writer");
             SinkWriter::Iceberg(IcebergSink::new(&config.sink, &tables).await?)
         }
-        "s3" => {
+        SinkMode::S3 => {
             info!("Using S3 sink writer");
             SinkWriter::S3(S3ParquetWriter::new(&config.sink)?)
         }
-        _ => {
+        SinkMode::Local => {
             info!(output_dir = %config.sink.output_dir, "Using local sink writer");
             SinkWriter::Local(LocalParquetWriter::new(&config.sink.output_dir)?)
         }
@@ -252,6 +253,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Track snapshot completion state for periodic offset saves
+    let snapshot_state: HashMap<String, bool> = if (snapshot_already_done
+        || matches!(binlog_start_pos, Some(_)))
+        && matches!(config.source.mode, SourceMode::FullLoadThenCdc)
+    {
+        config.source.tables.iter().map(|t| (t.clone(), true)).collect()
+    } else {
+        HashMap::new()
+    };
+
     // --- CDC phase ---
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PipelineMessage>(1024);
 
@@ -293,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
                             let rows = batch.num_rows() as u64;
                             writer.write_batch(&table_id.table, &batch).await?;
                             last_flush = Instant::now();
-                            let mut hs = health_state.lock().unwrap();
+                            let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
                             hs.events_processed += rows;
                             hs.last_flush_at = Some(chrono::Utc::now());
                         }
@@ -319,7 +330,7 @@ async fn main() -> anyhow::Result<()> {
                         writer.write_batch(&table_id.table, batch).await?;
                     }
                     last_flush = Instant::now();
-                    let mut hs = health_state.lock().unwrap();
+                    let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
                     hs.events_processed += total_rows;
                     hs.last_flush_at = Some(chrono::Utc::now());
                 }
@@ -329,13 +340,14 @@ async fn main() -> anyhow::Result<()> {
         // Periodic offset persistence (every 60s)
         if last_offset_save.elapsed() >= offset_save_interval {
             if let Some(ref store) = offset_store {
-                let pos = shared_binlog_pos.lock().unwrap().clone();
+                let pos = shared_binlog_pos.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 if !pos.filename.is_empty() {
-                    let offset = BinlogOffset::new(
+                    let mut offset = BinlogOffset::new(
                         pos.filename,
                         pos.position,
                         sequence.load(Ordering::Relaxed),
                     );
+                    offset.snapshot_complete = snapshot_state.clone();
                     if let Err(e) = store.save(&offset).await {
                         warn!(error = %e, "Failed to save periodic offset");
                     }
@@ -378,15 +390,24 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 3. Save final offset
-    if let (Some(ref store), Some(pos)) = (&offset_store, final_position) {
-        let offset = BinlogOffset::new(
-            pos.filename,
-            pos.position,
-            sequence.load(Ordering::Relaxed),
-        );
-        store.save(&offset).await?;
-        info!("Final offset saved");
+    // 3. Save final offset (use shared_binlog_pos as fallback if source errored)
+    if let Some(ref store) = offset_store {
+        let pos = final_position.unwrap_or_else(|| {
+            shared_binlog_pos.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        });
+        if !pos.filename.is_empty() {
+            let mut offset = BinlogOffset::new(
+                pos.filename,
+                pos.position,
+                sequence.load(Ordering::Relaxed),
+            );
+            offset.snapshot_complete = snapshot_state.clone();
+            if let Err(e) = store.save(&offset).await {
+                error!(error = %e, "Failed to save final offset");
+            } else {
+                info!("Final offset saved");
+            }
+        }
     }
 
     pool.disconnect().await?;

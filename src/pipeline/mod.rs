@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow_array::builder::*;
@@ -8,16 +9,54 @@ use tracing::{info, warn};
 use crate::source::types::{CdcEvent, ColumnValue, TableId};
 
 /// Per-table buffer that accumulates CdcEvents and flushes them as Arrow RecordBatches.
+/// Number of CDC metadata columns appended to every table's Arrow schema.
+const CDC_META_COLS: usize = 4; // _cdc_op, _cdc_ts, _cdc_seq, _cdc_schema_version
+
 pub struct TableBuffer {
     table_id: TableId,
     schema: SchemaRef,
-    /// One builder per column (user columns + 3 CDC metadata columns)
+    /// One builder per column (user columns + CDC metadata columns)
     builders: Vec<ColumnBuilder>,
     row_count: usize,
+    schema_version: u64,
 }
 
-/// A typed column builder wrapping Arrow's builder API.
-enum ColumnBuilder {
+/// Generates the ColumnBuilder enum and its mechanical methods (type_name,
+/// append_null_untyped, finish) from a declaration list. Decimal128 is handled
+/// separately because it carries extra state (scale).
+macro_rules! column_builder {
+    ( $( $variant:ident($builder_ty:ty) ),+ $(,)? ) => {
+        enum ColumnBuilder {
+            $( $variant($builder_ty), )+
+            Decimal128 { builder: Decimal128Builder, scale: i8 },
+        }
+
+        impl ColumnBuilder {
+            fn type_name(&self) -> &'static str {
+                match self {
+                    $( Self::$variant(_) => stringify!($variant), )+
+                    Self::Decimal128 { .. } => "Decimal128",
+                }
+            }
+
+            fn append_null_untyped(&mut self) {
+                match self {
+                    $( Self::$variant(b) => b.append_null(), )+
+                    Self::Decimal128 { builder: b, .. } => b.append_null(),
+                }
+            }
+
+            fn finish(&mut self) -> arrow::array::ArrayRef {
+                match self {
+                    $( Self::$variant(b) => Arc::new(b.finish()), )+
+                    Self::Decimal128 { builder: b, .. } => Arc::new(b.finish()),
+                }
+            }
+        }
+    };
+}
+
+column_builder! {
     Boolean(BooleanBuilder),
     Int8(Int8Builder),
     Int16(Int16Builder),
@@ -29,10 +68,6 @@ enum ColumnBuilder {
     UInt64(UInt64Builder),
     Float32(Float32Builder),
     Float64(Float64Builder),
-    Decimal128 {
-        builder: Decimal128Builder,
-        scale: i8,
-    },
     Date32(Date32Builder),
     TimestampMicro(TimestampMicrosecondBuilder),
     DurationMicro(DurationMicrosecondBuilder),
@@ -43,14 +78,24 @@ enum ColumnBuilder {
 /// Rescale a decimal mantissa from `source_scale` to `target_scale`.
 /// E.g. mantissa=1234, source_scale=2 (12.34), target_scale=4 → 12340000? No:
 /// 1234 at scale 2 = 12.34, at scale 4 needs mantissa 123400.
-fn rescale_decimal(mantissa: i128, source_scale: i8, target_scale: i8) -> i128 {
+/// Rescale a decimal mantissa from `source_scale` to `target_scale`.
+/// Returns `None` on overflow (e.g. large mantissa × large power of 10).
+fn rescale_decimal(mantissa: i128, source_scale: i8, target_scale: i8) -> Option<i128> {
     let diff = target_scale as i32 - source_scale as i32;
     if diff > 0 {
-        mantissa * 10i128.pow(diff as u32)
+        let factor = 10i128.checked_pow(diff as u32)?;
+        mantissa.checked_mul(factor)
     } else if diff < 0 {
-        mantissa / 10i128.pow((-diff) as u32)
+        let divisor = 10i128.checked_pow((-diff) as u32)?;
+        if mantissa % divisor != 0 {
+            warn!(
+                source_scale, target_scale, mantissa,
+                "Decimal scale-down truncation: losing fractional digits"
+            );
+        }
+        Some(mantissa / divisor)
     } else {
-        mantissa
+        Some(mantissa)
     }
 }
 
@@ -96,8 +141,10 @@ impl ColumnBuilder {
     /// Append a ColumnValue to this builder. On type mismatch, append null.
     fn append(&mut self, value: &ColumnValue, col_name: &str) {
         match (self, value) {
-            // --- NULL (any builder) ---
-            (builder, ColumnValue::Null) => builder.append_null_untyped(),
+            // --- NULL or conversion failed ---
+            (builder, ColumnValue::Null) | (builder, ColumnValue::ConversionFailed(_)) => {
+                builder.append_null_untyped();
+            }
 
             // --- Boolean ---
             (Self::Boolean(b), ColumnValue::Int(v)) => b.append_value(*v != 0),
@@ -178,15 +225,23 @@ impl ColumnBuilder {
 
             // --- Decimal ---
             (Self::Decimal128 { builder: b, scale }, ColumnValue::Decimal(d)) => {
-                let rescaled = rescale_decimal(d.mantissa(), d.scale() as i8, *scale);
-                b.append_value(rescaled);
+                match rescale_decimal(d.mantissa(), d.scale() as i8, *scale) {
+                    Some(v) => b.append_value(v),
+                    None => {
+                        warn!(column = col_name, "Decimal overflow during rescale, writing NULL");
+                        b.append_null();
+                    }
+                }
             }
             (Self::Decimal128 { builder: b, scale }, ColumnValue::String(s)) => {
                 match s.parse::<rust_decimal::Decimal>() {
-                    Ok(d) => {
-                        let rescaled = rescale_decimal(d.mantissa(), d.scale() as i8, *scale);
-                        b.append_value(rescaled);
-                    }
+                    Ok(d) => match rescale_decimal(d.mantissa(), d.scale() as i8, *scale) {
+                        Some(v) => b.append_value(v),
+                        None => {
+                            warn!(column = col_name, "Decimal overflow during rescale, writing NULL");
+                            b.append_null();
+                        }
+                    },
                     Err(_) => {
                         warn!(column = col_name, value = %s, "Failed to parse decimal");
                         b.append_null();
@@ -194,12 +249,22 @@ impl ColumnBuilder {
                 }
             }
             (Self::Decimal128 { builder: b, scale }, ColumnValue::Int(v)) => {
-                let factor = 10i128.pow(*scale as u32);
-                b.append_value(*v as i128 * factor);
+                match 10i128.checked_pow(*scale as u32).and_then(|f| (*v as i128).checked_mul(f)) {
+                    Some(val) => b.append_value(val),
+                    None => {
+                        warn!(column = col_name, "Decimal overflow, writing NULL");
+                        b.append_null();
+                    }
+                }
             }
             (Self::Decimal128 { builder: b, scale }, ColumnValue::UInt(v)) => {
-                let factor = 10i128.pow(*scale as u32);
-                b.append_value(*v as i128 * factor);
+                match 10i128.checked_pow(*scale as u32).and_then(|f| (*v as i128).checked_mul(f)) {
+                    Some(val) => b.append_value(val),
+                    None => {
+                        warn!(column = col_name, "Decimal overflow, writing NULL");
+                        b.append_null();
+                    }
+                }
             }
 
             // --- Date ---
@@ -238,10 +303,10 @@ impl ColumnBuilder {
             // --- Duration / TIME ---
             // TIME maps to Int64 (signed microseconds) since Iceberg doesn't support Arrow Duration
             (Self::Int64(b), ColumnValue::TimeMicros(micros)) => {
-                b.append_value(*micros);
+                b.append_value(micros.0);
             }
             (Self::DurationMicro(b), ColumnValue::TimeMicros(micros)) => {
-                b.append_value(*micros);
+                b.append_value(micros.0);
             }
 
             // --- String/Utf8 ---
@@ -277,78 +342,10 @@ impl ColumnBuilder {
             }
         }
     }
-
-    fn type_name(&self) -> &'static str {
-        match self {
-            Self::Boolean(_) => "Boolean",
-            Self::Int8(_) => "Int8",
-            Self::Int16(_) => "Int16",
-            Self::Int32(_) => "Int32",
-            Self::Int64(_) => "Int64",
-            Self::UInt8(_) => "UInt8",
-            Self::UInt16(_) => "UInt16",
-            Self::UInt32(_) => "UInt32",
-            Self::UInt64(_) => "UInt64",
-            Self::Float32(_) => "Float32",
-            Self::Float64(_) => "Float64",
-            Self::Decimal128 { .. } => "Decimal128",
-            Self::Date32(_) => "Date32",
-            Self::TimestampMicro(_) => "TimestampMicro",
-            Self::DurationMicro(_) => "DurationMicro",
-            Self::Utf8(_) => "Utf8",
-            Self::Binary(_) => "Binary",
-        }
-    }
-
-    fn append_null_untyped(&mut self) {
-        match self {
-            Self::Boolean(b) => b.append_null(),
-            Self::Int8(b) => b.append_null(),
-            Self::Int16(b) => b.append_null(),
-            Self::Int32(b) => b.append_null(),
-            Self::Int64(b) => b.append_null(),
-            Self::UInt8(b) => b.append_null(),
-            Self::UInt16(b) => b.append_null(),
-            Self::UInt32(b) => b.append_null(),
-            Self::UInt64(b) => b.append_null(),
-            Self::Float32(b) => b.append_null(),
-            Self::Float64(b) => b.append_null(),
-            Self::Decimal128 { builder: b, .. } => b.append_null(),
-            Self::Date32(b) => b.append_null(),
-            Self::TimestampMicro(b) => b.append_null(),
-            Self::DurationMicro(b) => b.append_null(),
-            Self::Utf8(b) => b.append_null(),
-            Self::Binary(b) => b.append_null(),
-        }
-    }
-
-    fn finish(&mut self) -> arrow::array::ArrayRef {
-        match self {
-            Self::Boolean(b) => Arc::new(b.finish()),
-            Self::Int8(b) => Arc::new(b.finish()),
-            Self::Int16(b) => Arc::new(b.finish()),
-            Self::Int32(b) => Arc::new(b.finish()),
-            Self::Int64(b) => Arc::new(b.finish()),
-            Self::UInt8(b) => Arc::new(b.finish()),
-            Self::UInt16(b) => Arc::new(b.finish()),
-            Self::UInt32(b) => Arc::new(b.finish()),
-            Self::UInt64(b) => Arc::new(b.finish()),
-            Self::Float32(b) => Arc::new(b.finish()),
-            Self::Float64(b) => Arc::new(b.finish()),
-            Self::Decimal128 { builder: b, .. } => Arc::new(b.finish()),
-            Self::Date32(b) => Arc::new(b.finish()),
-            Self::TimestampMicro(b) => Arc::new(b.finish()),
-            Self::DurationMicro(b) => Arc::new(b.finish()),
-            Self::Utf8(b) => Arc::new(b.finish()),
-            Self::Binary(b) => Arc::new(b.finish()),
-        }
-    }
 }
 
-use std::sync::Arc;
-
 impl TableBuffer {
-    pub fn new(table_id: TableId, schema: SchemaRef) -> Self {
+    pub fn new(table_id: TableId, schema: SchemaRef, schema_version: u64) -> Self {
         let builders = schema
             .fields()
             .iter()
@@ -360,21 +357,21 @@ impl TableBuffer {
             schema,
             builders,
             row_count: 0,
+            schema_version,
         }
     }
 
     /// Append a CdcEvent to the buffer. The event's columns must match the user columns.
     pub fn append(&mut self, event: &CdcEvent) {
-        let num_user_cols = self.schema.fields().len() - 3; // minus CDC metadata
+        let num_user_cols = self.schema.fields().len() - CDC_META_COLS;
 
-        // Append user columns (positional access — both event columns and schema
+        // Append user columns (positional access — both event values and schema
         // columns are ordered by INFORMATION_SCHEMA.ordinal_position)
         for (i, builder) in self.builders.iter_mut().enumerate().take(num_user_cols) {
             let col_name = self.schema.field(i).name();
             let value = event
-                .columns
+                .values
                 .get(i)
-                .map(|(_, v)| v)
                 .unwrap_or(&ColumnValue::Null);
             builder.append(value, col_name);
         }
@@ -391,6 +388,10 @@ impl TableBuffer {
         // _cdc_seq
         if let ColumnBuilder::Int64(b) = &mut self.builders[num_user_cols + 2] {
             b.append_value(event.sequence);
+        }
+        // _cdc_schema_version
+        if let ColumnBuilder::Int64(b) = &mut self.builders[num_user_cols + 3] {
+            b.append_value(self.schema_version as i64);
         }
 
         self.row_count += 1;
@@ -435,7 +436,7 @@ impl TableBuffer {
 /// Pipeline orchestrates per-table buffering and flush triggers.
 pub struct Pipeline {
     buffers: HashMap<TableId, TableBuffer>,
-    schemas: HashMap<TableId, SchemaRef>,
+    schemas: HashMap<TableId, (SchemaRef, u64)>, // (schema, version)
     batch_size: usize,
 }
 
@@ -449,10 +450,10 @@ impl Pipeline {
 
         for table in tables {
             let tid = table.table_id.clone();
-            schemas.insert(tid.clone(), table.arrow_schema.clone());
+            schemas.insert(tid.clone(), (table.arrow_schema.clone(), table.schema_version));
             buffers.insert(
                 tid.clone(),
-                TableBuffer::new(tid, table.arrow_schema.clone()),
+                TableBuffer::new(tid, table.arrow_schema.clone(), table.schema_version),
             );
         }
 
@@ -471,24 +472,25 @@ impl Pipeline {
         new_schema: SchemaRef,
     ) -> Option<(TableId, RecordBatch)> {
         info!(table = %tid, "Schema change — flushing old buffer");
-        let result = if let Some(buffer) = self.buffers.get_mut(tid) {
+        if let Some(buffer) = self.buffers.get_mut(tid) {
             if !buffer.is_empty() {
                 match buffer.flush() {
-                    Ok(batch) => Some((tid.clone(), batch)),
+                    Ok(batch) => {
+                        self.buffers.remove(tid);
+                        self.update_schema(tid, new_schema);
+                        return Some((tid.clone(), batch));
+                    }
                     Err(e) => {
-                        warn!(table = %tid, error = %e, "Failed to flush during schema change");
-                        None
+                        warn!(table = %tid, error = %e, "Failed to flush during schema change, keeping old buffer");
+                        return None;
                     }
                 }
             } else {
-                None
+                self.buffers.remove(tid);
             }
-        } else {
-            None
-        };
-        self.buffers.remove(tid);
+        }
         self.update_schema(tid, new_schema);
-        result
+        None
     }
 
     /// Ingest a single CDC event. Returns a RecordBatch if a flush was triggered.
@@ -497,13 +499,14 @@ impl Pipeline {
 
         // Ensure buffer exists
         if !self.buffers.contains_key(tid) {
-            if let Some(schema) = self.schemas.get(tid) {
-                self.buffers
-                    .insert(tid.clone(), TableBuffer::new(tid.clone(), schema.clone()));
-            } else {
-                warn!(table = %tid, "No schema for table, skipping event");
-                return None;
-            }
+            let (schema, version) = match self.schemas.get(tid) {
+                Some(sv) => sv.clone(),
+                None => {
+                    warn!(table = %tid, "No schema for table, skipping event");
+                    return None;
+                }
+            };
+            self.buffers.insert(tid.clone(), TableBuffer::new(tid.clone(), schema, version));
         }
 
         let buffer = self.buffers.get_mut(tid).unwrap();
@@ -520,7 +523,8 @@ impl Pipeline {
 
     /// Update the schema for a table (called after schema evolution).
     pub fn update_schema(&mut self, tid: &TableId, schema: SchemaRef) {
-        self.schemas.insert(tid.clone(), schema);
+        let version = self.schemas.get(tid).map(|(_, v)| v + 1).unwrap_or(1);
+        self.schemas.insert(tid.clone(), (schema, version));
         // Remove existing buffer so it gets recreated with new schema
         self.buffers.remove(tid);
     }
@@ -542,6 +546,7 @@ impl Pipeline {
     }
 
     /// Total buffered rows across all tables.
+    #[allow(dead_code)]
     pub fn total_buffered(&self) -> usize {
         self.buffers.values().map(|b| b.len()).sum()
     }
@@ -565,6 +570,7 @@ mod tests {
             Field::new("_cdc_op", DataType::Utf8, false),
             Field::new("_cdc_ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
             Field::new("_cdc_seq", DataType::Int64, false),
+            Field::new("_cdc_schema_version", DataType::Int64, false),
         ]))
     }
 
@@ -581,11 +587,11 @@ mod tests {
             op: CdcOp::Insert,
             timestamp: DateTime::<Utc>::from(std::time::SystemTime::UNIX_EPOCH),
             sequence: seq,
-            columns: vec![
-                ("id".to_string(), ColumnValue::Int(id)),
-                ("name".to_string(), ColumnValue::String(name.to_string())),
-                ("amount".to_string(), ColumnValue::Decimal(amount)),
-                ("active".to_string(), ColumnValue::Bool(active)),
+            values: vec![
+                ColumnValue::Int(id),
+                ColumnValue::String(name.to_string()),
+                ColumnValue::Decimal(amount),
+                ColumnValue::Bool(active),
             ],
         }
     }
@@ -599,9 +605,10 @@ mod tests {
             Field::new("_cdc_op", DataType::Utf8, false),
             Field::new("_cdc_ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
             Field::new("_cdc_seq", DataType::Int64, false),
+            Field::new("_cdc_schema_version", DataType::Int64, false),
         ]));
 
-        let mut buffer = TableBuffer::new(test_table_id(), schema);
+        let mut buffer = TableBuffer::new(test_table_id(), schema, 1);
 
         // Decimal with scale 2 going into scale 4 column
         let d = rust_decimal::Decimal::new(1234, 2); // 12.34
@@ -610,7 +617,7 @@ mod tests {
             op: CdcOp::Insert,
             timestamp: DateTime::<Utc>::from(std::time::SystemTime::UNIX_EPOCH),
             sequence: 0,
-            columns: vec![("val".to_string(), ColumnValue::Decimal(d))],
+            values: vec![ColumnValue::Decimal(d)],
         };
         buffer.append(&event);
 
@@ -627,15 +634,16 @@ mod tests {
             Field::new("_cdc_op", DataType::Utf8, false),
             Field::new("_cdc_ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
             Field::new("_cdc_seq", DataType::Int64, false),
+            Field::new("_cdc_schema_version", DataType::Int64, false),
         ]));
 
-        let mut buffer = TableBuffer::new(test_table_id(), schema);
+        let mut buffer = TableBuffer::new(test_table_id(), schema, 1);
         let event = CdcEvent {
             table: test_table_id(),
             op: CdcOp::Insert,
             timestamp: DateTime::<Utc>::from(std::time::SystemTime::UNIX_EPOCH),
             sequence: 0,
-            columns: vec![("val".to_string(), ColumnValue::Int(42))],
+            values: vec![ColumnValue::Int(42)],
         };
         buffer.append(&event);
 
@@ -684,7 +692,7 @@ mod tests {
     fn time_micros_to_int64() {
         let mut builder = ColumnBuilder::new_for_type(&DataType::Int64);
         let micros = -5_400_000_000i64; // -1.5 hours
-        builder.append(&ColumnValue::TimeMicros(micros), "test");
+        builder.append(&ColumnValue::TimeMicros(crate::source::types::TimeMicroseconds(micros)), "test");
         let arr = builder.finish();
         let ints = arr.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
         assert_eq!(ints.value(0), micros);
@@ -695,7 +703,7 @@ mod tests {
     #[test]
     fn table_buffer_flush() {
         let schema = test_schema();
-        let mut buffer = TableBuffer::new(test_table_id(), schema.clone());
+        let mut buffer = TableBuffer::new(test_table_id(), schema.clone(), 1);
 
         let d = rust_decimal::Decimal::new(9999, 2); // 99.99
         buffer.append(&make_event(1, "alice", d, true, 0));
@@ -704,7 +712,7 @@ mod tests {
         assert_eq!(buffer.len(), 2);
         let batch = buffer.flush().unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 7); // 4 user + 3 cdc
+        assert_eq!(batch.num_columns(), 8); // 4 user + 4 cdc
         assert_eq!(buffer.len(), 0);
     }
 
@@ -718,34 +726,35 @@ mod tests {
                 crate::source::types::ColumnMeta {
                     name: "id".to_string(),
                     ordinal: 1,
-                    mysql_type: "int".to_string(),
+                    col_type: crate::source::types::MysqlType::Int { unsigned: false },
+                    mysql_type_raw: "int".to_string(),
                     nullable: false,
-                    is_unsigned: false,
                 },
                 crate::source::types::ColumnMeta {
                     name: "name".to_string(),
                     ordinal: 2,
-                    mysql_type: "varchar(255)".to_string(),
+                    col_type: crate::source::types::MysqlType::Varchar,
+                    mysql_type_raw: "varchar(255)".to_string(),
                     nullable: true,
-                    is_unsigned: false,
                 },
                 crate::source::types::ColumnMeta {
                     name: "amount".to_string(),
                     ordinal: 3,
-                    mysql_type: "decimal(10,2)".to_string(),
+                    col_type: crate::source::types::MysqlType::Decimal { precision: 10, scale: 2 },
+                    mysql_type_raw: "decimal(10,2)".to_string(),
                     nullable: true,
-                    is_unsigned: false,
                 },
                 crate::source::types::ColumnMeta {
                     name: "active".to_string(),
                     ordinal: 4,
-                    mysql_type: "tinyint(1)".to_string(),
+                    col_type: crate::source::types::MysqlType::TinyintBool,
+                    mysql_type_raw: "tinyint(1)".to_string(),
                     nullable: true,
-                    is_unsigned: false,
                 },
             ],
             primary_key_columns: vec!["id".to_string()],
             arrow_schema: test_schema(),
+            schema_version: 1,
         };
 
         let batch_size = 3;
@@ -802,5 +811,88 @@ mod tests {
             let arr = builder.finish();
             assert!(arr.is_null(0), "NULL not handled for {:?}", dt);
         }
+    }
+
+    // --- rescale_decimal edge cases ---
+
+    #[test]
+    fn rescale_same_scale() {
+        assert_eq!(rescale_decimal(1234, 2, 2), Some(1234));
+    }
+
+    #[test]
+    fn rescale_scale_down() {
+        assert_eq!(rescale_decimal(12345, 4, 2), Some(123));
+    }
+
+    #[test]
+    fn rescale_negative_mantissa() {
+        assert_eq!(rescale_decimal(-1234, 2, 4), Some(-123400));
+    }
+
+    #[test]
+    fn rescale_zero() {
+        assert_eq!(rescale_decimal(0, 2, 4), Some(0));
+        assert_eq!(rescale_decimal(0, 4, 2), Some(0));
+    }
+
+    #[test]
+    fn rescale_overflow() {
+        // i128::MAX with scale-up should overflow
+        assert_eq!(rescale_decimal(i128::MAX, 0, 10), None);
+    }
+
+    // --- Event with fewer columns than schema ---
+
+    #[test]
+    fn ingest_sparse_columns() {
+        let schema = test_schema(); // 4 user columns + 3 CDC
+        let mut buffer = TableBuffer::new(test_table_id(), schema, 1);
+
+        // Event with only 2 of the 4 user columns
+        let event = CdcEvent {
+            table: test_table_id(),
+            op: CdcOp::Insert,
+            timestamp: DateTime::<Utc>::from(std::time::SystemTime::UNIX_EPOCH),
+            sequence: 0,
+            values: vec![
+                ColumnValue::Int(1),
+                ColumnValue::String("alice".to_string()),
+            ],
+        };
+        buffer.append(&event);
+
+        let batch = buffer.flush().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        // Missing columns should be NULL
+        let amount = batch.column(2); // amount column
+        assert!(amount.is_null(0));
+        let active = batch.column(3); // active column
+        assert!(active.is_null(0));
+    }
+
+    // --- SinkMode config parsing ---
+
+    #[test]
+    fn sink_mode_rejects_invalid() {
+        let toml_str = r#"
+            [source]
+            host = "localhost"
+            port = 3306
+            user = "root"
+            password = "root"
+            server_id = 1
+            database = "test"
+            tables = ["t"]
+
+            [sink]
+            mode = "bogus"
+            [sink.writer]
+
+            [state]
+            [observability]
+        "#;
+        let result: Result<crate::config::Config, _> = toml::from_str(toml_str);
+        assert!(result.is_err(), "Should reject invalid sink mode");
     }
 }

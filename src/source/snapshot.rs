@@ -52,6 +52,7 @@ impl SnapshotReader {
         // 1. Start a consistent snapshot transaction
         conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
             .await?;
+        let snapshot_ts = chrono::Utc::now();
         info!("Started consistent snapshot transaction");
 
         // 2. Capture binlog position inside the snapshot
@@ -73,7 +74,7 @@ impl SnapshotReader {
                 });
             }
 
-            self.snapshot_table(&mut conn, table_meta, tx, shutdown)
+            self.snapshot_table(&mut conn, table_meta, tx, shutdown, snapshot_ts)
                 .await?;
         }
 
@@ -95,6 +96,7 @@ impl SnapshotReader {
         table_meta: &TableMeta,
         tx: &tokio::sync::mpsc::Sender<PipelineMessage>,
         shutdown: &AtomicBool,
+        snapshot_ts: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), SourceError> {
         let db = &self.config.database;
         let table = &table_meta.table_id.table;
@@ -116,7 +118,7 @@ impl SnapshotReader {
                 if shutdown.load(Ordering::Relaxed) {
                     return Ok(());
                 }
-                let event = self.row_to_event(row, table_meta);
+                let event = self.row_to_event(row, table_meta, snapshot_ts);
                 if tx.send(PipelineMessage::Event(event)).await.is_err() {
                     return Err(SourceError::ChannelClosed);
                 }
@@ -137,7 +139,7 @@ impl SnapshotReader {
                         "SELECT {} FROM `{}`.`{}` ORDER BY `{}` LIMIT {}",
                         select_cols, db, table, pk, chunk_size
                     ),
-                    Some(val) => format!(
+                    Some(_val) => format!(
                         "SELECT {} FROM `{}`.`{}` WHERE `{}` > :last_pk ORDER BY `{}` LIMIT {}",
                         select_cols, db, table, pk, pk, chunk_size
                     ),
@@ -168,7 +170,7 @@ impl SnapshotReader {
                 last_pk_value = last_row.get::<mysql_async::Value, _>(pk_idx);
 
                 for row in rows {
-                    let event = self.row_to_event(row, table_meta);
+                    let event = self.row_to_event(row, table_meta, snapshot_ts);
                     if tx.send(PipelineMessage::Event(event)).await.is_err() {
                         return Err(SourceError::ChannelClosed);
                     }
@@ -213,7 +215,7 @@ impl SnapshotReader {
                 let chunk_len = rows.len();
 
                 for row in rows {
-                    let event = self.row_to_event(row, table_meta);
+                    let event = self.row_to_event(row, table_meta, snapshot_ts);
                     if tx.send(PipelineMessage::Event(event)).await.is_err() {
                         return Err(SourceError::ChannelClosed);
                     }
@@ -240,14 +242,14 @@ impl SnapshotReader {
     }
 
     /// Convert a mysql_async::Row (from SELECT) to a CdcEvent.
-    fn row_to_event(&self, row: mysql_async::Row, table_meta: &TableMeta) -> CdcEvent {
-        let columns: Vec<(String, ColumnValue)> = table_meta
+    fn row_to_event(&self, row: mysql_async::Row, table_meta: &TableMeta, snapshot_ts: chrono::DateTime<chrono::Utc>) -> CdcEvent {
+        let values: Vec<ColumnValue> = table_meta
             .columns
             .iter()
             .enumerate()
             .map(|(i, col)| {
                 let value: Option<mysql_async::Value> = row.get(i);
-                let cv = match value {
+                match value {
                     None | Some(mysql_async::Value::NULL) => ColumnValue::Null,
                     Some(v) => {
                         match super::binlog::convert_mysql_value(v, col) {
@@ -257,14 +259,13 @@ impl SnapshotReader {
                                     table = %table_meta.table_id,
                                     column = %col.name,
                                     error = %e,
-                                    "Snapshot row conversion error, writing NULL"
+                                    "Snapshot row conversion error"
                                 );
-                                ColumnValue::Null
+                                ColumnValue::ConversionFailed(e.to_string())
                             }
                         }
                     }
-                };
-                (col.name.clone(), cv)
+                }
             })
             .collect();
 
@@ -273,9 +274,9 @@ impl SnapshotReader {
         CdcEvent {
             table: table_meta.table_id.clone(),
             op: CdcOp::Snapshot,
-            timestamp: chrono::Utc::now(),
+            timestamp: snapshot_ts,
             sequence: seq,
-            columns,
+            values,
         }
     }
 }

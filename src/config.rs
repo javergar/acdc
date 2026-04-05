@@ -29,11 +29,19 @@ pub enum SourceMode {
     FullLoadThenCdc,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkMode {
+    #[default]
+    Local,
+    S3,
+    Iceberg,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SinkConfig {
-    /// "local" or "s3" (later: "iceberg")
-    #[serde(default = "default_sink_mode")]
-    pub mode: String,
+    #[serde(default)]
+    pub mode: SinkMode,
     /// Local output directory (mode = "local")
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
@@ -53,10 +61,6 @@ pub struct SinkConfig {
     pub writer: WriterConfig,
 }
 
-fn default_sink_mode() -> String {
-    "local".to_string()
-}
-
 fn default_output_dir() -> String {
     "./output".to_string()
 }
@@ -68,6 +72,7 @@ pub struct WriterConfig {
     #[serde(default = "default_flush_interval")]
     pub flush_interval_secs: u64,
     #[serde(default = "default_file_size")]
+    #[allow(dead_code)]
     pub target_file_size_mb: usize,
 }
 

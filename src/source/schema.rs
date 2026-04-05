@@ -4,7 +4,7 @@ use mysql_async::Pool;
 use std::sync::Arc;
 use tracing::debug;
 
-use super::types::{ColumnMeta, TableId};
+use super::types::{ColumnMeta, MysqlType, TableId};
 use super::SourceError;
 
 /// Schema metadata for a single MySQL table.
@@ -15,75 +15,90 @@ pub struct TableMeta {
     pub primary_key_columns: Vec<String>,
     /// Arrow schema including user columns + CDC metadata columns
     pub arrow_schema: Arc<Schema>,
+    /// Incremented on each schema change (ALTER TABLE)
+    pub schema_version: u64,
 }
 
 /// CDC metadata column names appended to every table's Arrow schema.
 pub const CDC_OP_COL: &str = "_cdc_op";
 pub const CDC_TS_COL: &str = "_cdc_ts";
 pub const CDC_SEQ_COL: &str = "_cdc_seq";
+pub const CDC_SCHEMA_VERSION_COL: &str = "_cdc_schema_version";
 
-/// Map a MySQL column_type string to an Arrow DataType.
-///
-/// The column_type comes from INFORMATION_SCHEMA.COLUMNS (e.g. "int", "varchar(255)",
-/// "bigint unsigned", "decimal(10,2)").
-pub fn mysql_type_to_arrow(col: &ColumnMeta) -> DataType {
-    let base = mysql_base_type(&col.mysql_type);
+/// Parse a raw MySQL column_type string into a structured MysqlType.
+pub fn parse_mysql_type(raw: &str) -> MysqlType {
+    let s = raw.trim().to_lowercase();
+    let base = mysql_base_type(&s);
+    let unsigned = s.contains(" unsigned");
+
     match base {
-        // Iceberg doesn't support unsigned types. Widen to next signed type.
-        // tinyint(1) = BOOLEAN, otherwise signed fits in same type, unsigned widens.
         "tinyint" => {
-            if col.mysql_type == "tinyint(1)" {
-                DataType::Boolean
-            } else if col.is_unsigned {
-                DataType::Int16 // UInt8 max 255 fits in Int16
+            if s == "tinyint(1)" {
+                MysqlType::TinyintBool
             } else {
-                DataType::Int8
+                MysqlType::Tinyint { unsigned }
             }
         }
-        "smallint" => {
-            if col.is_unsigned {
-                DataType::Int32 // UInt16 max 65535 fits in Int32
-            } else {
-                DataType::Int16
-            }
-        }
-        "mediumint" | "int" | "integer" => {
-            if col.is_unsigned {
-                DataType::Int64 // UInt32 max ~4B fits in Int64
-            } else {
-                DataType::Int32
-            }
-        }
-        "bigint" => {
-            // UInt64 doesn't fit in Int64 but Iceberg has no UInt64.
-            // Use Int64 and accept potential overflow for values > i64::MAX.
-            DataType::Int64
-        }
-        "float" => DataType::Float32,
-        "double" | "real" => DataType::Float64,
+        "smallint" => MysqlType::Smallint { unsigned },
+        "mediumint" => MysqlType::Mediumint { unsigned },
+        "int" | "integer" => MysqlType::Int { unsigned },
+        "bigint" => MysqlType::Bigint { unsigned },
+        "float" => MysqlType::Float,
+        "double" | "real" => MysqlType::Double,
         "decimal" | "numeric" => {
-            let (p, s) = parse_precision_scale(&col.mysql_type);
-            DataType::Decimal128(p, s)
+            let (p, sc) = parse_precision_scale(&s);
+            MysqlType::Decimal { precision: p, scale: sc }
         }
-        "date" => DataType::Date32,
-        "datetime" | "timestamp" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        // TIME stored as Int64 microseconds (signed, supports negative TIME values).
-        // Arrow Duration is not supported by Iceberg, so use Int64 directly.
-        "time" => DataType::Int64,
-        "year" => DataType::Int16,
-        "char" | "varchar" | "text" | "tinytext" | "mediumtext" | "longtext" | "enum" | "set"
-        | "json" => DataType::Utf8,
-        "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "bit" => {
-            DataType::Binary
+        "date" => MysqlType::Date,
+        "datetime" => MysqlType::DateTime,
+        "timestamp" => MysqlType::Timestamp,
+        "time" => MysqlType::Time,
+        "year" => MysqlType::Year,
+        "char" => MysqlType::Char,
+        "varchar" => MysqlType::Varchar,
+        "text" | "tinytext" | "mediumtext" | "longtext" => MysqlType::Text,
+        "enum" => MysqlType::Enum,
+        "set" => MysqlType::Set,
+        "json" => MysqlType::Json,
+        "binary" => MysqlType::Binary,
+        "varbinary" => MysqlType::Varbinary,
+        "blob" | "tinyblob" | "mediumblob" | "longblob" => MysqlType::Blob,
+        "bit" => MysqlType::Bit,
+        "point" | "linestring" | "polygon" | "geometry" | "multipoint"
+        | "multilinestring" | "multipolygon" | "geomcollection" | "geometrycollection" => {
+            MysqlType::Spatial
         }
-        // Spatial types → WKB binary
-        "point" | "linestring" | "polygon" | "geometry" | "multipoint" | "multilinestring"
-        | "multipolygon" | "geomcollection" | "geometrycollection" => DataType::Binary,
-        // Fallback
         _ => {
-            tracing::warn!(mysql_type = %col.mysql_type, "Unknown MySQL type, mapping to Utf8");
-            DataType::Utf8
+            tracing::warn!(mysql_type = %raw, "Unknown MySQL type, mapping to Text");
+            MysqlType::Text
         }
+    }
+}
+
+/// Map a structured MysqlType to an Arrow DataType.
+pub fn mysql_type_to_arrow(col: &ColumnMeta) -> DataType {
+    match &col.col_type {
+        MysqlType::TinyintBool => DataType::Boolean,
+        MysqlType::Tinyint { unsigned: true } => DataType::Int16,
+        MysqlType::Tinyint { unsigned: false } => DataType::Int8,
+        MysqlType::Smallint { unsigned: true } => DataType::Int32,
+        MysqlType::Smallint { unsigned: false } => DataType::Int16,
+        MysqlType::Mediumint { unsigned: true } | MysqlType::Int { unsigned: true } => DataType::Int64,
+        MysqlType::Mediumint { unsigned: false } | MysqlType::Int { unsigned: false } => DataType::Int32,
+        MysqlType::Bigint { .. } => DataType::Int64,
+        MysqlType::Float => DataType::Float32,
+        MysqlType::Double => DataType::Float64,
+        MysqlType::Decimal { precision, scale } => DataType::Decimal128(*precision, *scale),
+        MysqlType::Date => DataType::Date32,
+        MysqlType::DateTime | MysqlType::Timestamp => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        }
+        MysqlType::Time => DataType::Int64,
+        MysqlType::Year => DataType::Int16,
+        MysqlType::Char | MysqlType::Varchar | MysqlType::Text
+        | MysqlType::Enum | MysqlType::Set | MysqlType::Json => DataType::Utf8,
+        MysqlType::Binary | MysqlType::Varbinary | MysqlType::Blob
+        | MysqlType::Bit | MysqlType::Spatial => DataType::Binary,
     }
 }
 
@@ -128,6 +143,13 @@ pub fn build_arrow_schema(columns: &[ColumnMeta]) -> Arc<Schema> {
         Field::new(CDC_SEQ_COL, DataType::Int64, false).with_metadata(
             std::collections::HashMap::from([
                 (parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(), (next_id + 2).to_string()),
+            ]),
+        ),
+    );
+    fields.push(
+        Field::new(CDC_SCHEMA_VERSION_COL, DataType::Int64, false).with_metadata(
+            std::collections::HashMap::from([
+                (parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(), (next_id + 3).to_string()),
             ]),
         ),
     );
@@ -203,14 +225,14 @@ pub async fn introspect_table(
 
     let column_metas: Vec<ColumnMeta> = columns
         .into_iter()
-        .map(|(name, ordinal, col_type, nullable)| {
-            let is_unsigned = col_type.contains(" unsigned");
+        .map(|(name, ordinal, col_type_raw, nullable)| {
+            let col_type = parse_mysql_type(&col_type_raw);
             ColumnMeta {
                 name,
                 ordinal: ordinal as usize,
-                mysql_type: col_type,
+                col_type,
+                mysql_type_raw: col_type_raw,
                 nullable: nullable == "YES",
-                is_unsigned,
             }
         })
         .collect();
@@ -243,6 +265,7 @@ pub async fn introspect_table(
         columns: column_metas,
         primary_key_columns: pk_columns,
         arrow_schema,
+        schema_version: 1,
     })
 }
 
@@ -265,51 +288,51 @@ mod tests {
     use super::*;
     use crate::source::types::ColumnMeta;
 
-    fn col(mysql_type: &str, unsigned: bool) -> ColumnMeta {
+    fn col(mysql_type_raw: &str) -> ColumnMeta {
         ColumnMeta {
             name: "test".to_string(),
             ordinal: 0,
-            mysql_type: mysql_type.to_string(),
+            col_type: parse_mysql_type(mysql_type_raw),
+            mysql_type_raw: mysql_type_raw.to_string(),
             nullable: true,
-            is_unsigned: unsigned,
         }
     }
 
     #[test]
     fn tinyint1_is_boolean() {
-        assert_eq!(mysql_type_to_arrow(&col("tinyint(1)", false)), DataType::Boolean);
+        assert_eq!(mysql_type_to_arrow(&col("tinyint(1)")), DataType::Boolean);
     }
 
     #[test]
     fn tinyint_signed() {
-        assert_eq!(mysql_type_to_arrow(&col("tinyint", false)), DataType::Int8);
+        assert_eq!(mysql_type_to_arrow(&col("tinyint")), DataType::Int8);
     }
 
     #[test]
     fn tinyint_unsigned_widens() {
-        assert_eq!(mysql_type_to_arrow(&col("tinyint unsigned", true)), DataType::Int16);
+        assert_eq!(mysql_type_to_arrow(&col("tinyint unsigned")), DataType::Int16);
     }
 
     #[test]
     fn smallint_unsigned_widens() {
-        assert_eq!(mysql_type_to_arrow(&col("smallint unsigned", true)), DataType::Int32);
+        assert_eq!(mysql_type_to_arrow(&col("smallint unsigned")), DataType::Int32);
     }
 
     #[test]
     fn int_unsigned_widens() {
-        assert_eq!(mysql_type_to_arrow(&col("int unsigned", true)), DataType::Int64);
+        assert_eq!(mysql_type_to_arrow(&col("int unsigned")), DataType::Int64);
     }
 
     #[test]
     fn bigint_always_int64() {
-        assert_eq!(mysql_type_to_arrow(&col("bigint", false)), DataType::Int64);
-        assert_eq!(mysql_type_to_arrow(&col("bigint unsigned", true)), DataType::Int64);
+        assert_eq!(mysql_type_to_arrow(&col("bigint")), DataType::Int64);
+        assert_eq!(mysql_type_to_arrow(&col("bigint unsigned")), DataType::Int64);
     }
 
     #[test]
     fn decimal_with_precision() {
         assert_eq!(
-            mysql_type_to_arrow(&col("decimal(10,2)", false)),
+            mysql_type_to_arrow(&col("decimal(10,2)")),
             DataType::Decimal128(10, 2)
         );
     }
@@ -318,42 +341,42 @@ mod tests {
     fn decimal_clamped_precision() {
         // MySQL allows DECIMAL(65,30), Arrow caps at 38
         assert_eq!(
-            mysql_type_to_arrow(&col("decimal(65,30)", false)),
+            mysql_type_to_arrow(&col("decimal(65,30)")),
             DataType::Decimal128(38, 30)
         );
     }
 
     #[test]
     fn time_is_int64() {
-        assert_eq!(mysql_type_to_arrow(&col("time", false)), DataType::Int64);
+        assert_eq!(mysql_type_to_arrow(&col("time")), DataType::Int64);
     }
 
     #[test]
     fn json_is_utf8() {
-        assert_eq!(mysql_type_to_arrow(&col("json", false)), DataType::Utf8);
+        assert_eq!(mysql_type_to_arrow(&col("json")), DataType::Utf8);
     }
 
     #[test]
     fn year_is_int16() {
-        assert_eq!(mysql_type_to_arrow(&col("year", false)), DataType::Int16);
+        assert_eq!(mysql_type_to_arrow(&col("year")), DataType::Int16);
     }
 
     #[test]
     fn datetime_is_timestamp() {
         assert_eq!(
-            mysql_type_to_arrow(&col("datetime", false)),
+            mysql_type_to_arrow(&col("datetime")),
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         );
     }
 
     #[test]
     fn blob_is_binary() {
-        assert_eq!(mysql_type_to_arrow(&col("blob", false)), DataType::Binary);
+        assert_eq!(mysql_type_to_arrow(&col("blob")), DataType::Binary);
     }
 
     #[test]
     fn enum_is_utf8() {
-        assert_eq!(mysql_type_to_arrow(&col("enum", false)), DataType::Utf8);
+        assert_eq!(mysql_type_to_arrow(&col("enum")), DataType::Utf8);
     }
 
     // --- parse_precision_scale ---
