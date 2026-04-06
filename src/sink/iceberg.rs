@@ -25,6 +25,7 @@ use crate::source::schema::TableMeta;
 /// Iceberg sink: writes Parquet to S3, then commits data files to the Iceberg catalog.
 pub struct IcebergSink {
     catalog: RestCatalog,
+    catalog_config: RestCatalogConfig,
     namespace: NamespaceIdent,
     ns_name: String,
     s3_store: Arc<dyn ObjectStore>,
@@ -34,6 +35,8 @@ pub struct IcebergSink {
     tables: HashMap<String, Table>,
     /// Arrow schemas per table name
     schemas: HashMap<String, SchemaRef>,
+    /// When we last refreshed the catalog client (for token rotation)
+    catalog_created_at: Instant,
 }
 
 impl IcebergSink {
@@ -98,6 +101,7 @@ impl IcebergSink {
             .warehouse(rest_warehouse)
             .props(props)
             .build();
+        let catalog_config_clone = catalog_config.clone();
         let catalog = RestCatalog::new(catalog_config);
 
         let namespace = NamespaceIdent::from_strs([namespace_str])?;
@@ -128,6 +132,7 @@ impl IcebergSink {
 
         Ok(Self {
             catalog,
+            catalog_config: catalog_config_clone,
             ns_name: namespace_str.to_string(),
             namespace,
             s3_store,
@@ -135,7 +140,20 @@ impl IcebergSink {
             bucket: bucket.to_string(),
             tables: HashMap::new(),
             schemas,
+            catalog_created_at: Instant::now(),
         })
+    }
+
+    /// Recreate the catalog client if the OAuth token is likely expired.
+    /// Polaris tokens default to 3600s TTL; we refresh at 50 minutes.
+    fn refresh_catalog_if_needed(&mut self) {
+        const TOKEN_REFRESH_SECS: u64 = 50 * 60;
+        if self.catalog_created_at.elapsed().as_secs() > TOKEN_REFRESH_SECS {
+            info!("Refreshing Iceberg catalog client (token rotation)");
+            self.catalog = RestCatalog::new(self.catalog_config.clone());
+            self.tables.clear(); // table handles carry the old token's FileIO
+            self.catalog_created_at = Instant::now();
+        }
     }
 
     /// Ensure an Iceberg table exists, creating it if needed. Returns the table handle.
@@ -212,6 +230,9 @@ impl IcebergSink {
         batch: &RecordBatch,
     ) -> anyhow::Result<String> {
         let write_start = Instant::now();
+
+        // 0. Refresh catalog client if OAuth token is about to expire
+        self.refresh_catalog_if_needed();
 
         // 1. Ensure table exists in catalog
         self.ensure_table(table_name).await?;
