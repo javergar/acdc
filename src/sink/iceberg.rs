@@ -298,39 +298,61 @@ impl IcebergSink {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build DataFile: {}", e))?;
 
-        // 5. Commit to Iceberg catalog via transaction (with retry for transient failures)
+        // 5. Commit to Iceberg catalog via transaction.
+        // On 409 conflict (stale snapshot), reload the table from the catalog and retry.
+        // On auth error (401/403), refresh the catalog client and retry.
         let updated_table = {
-            let table = self.tables.get(table_name).unwrap();
-            let catalog = &self.catalog;
-            retry("iceberg_commit", 3, || {
-                let data_file = data_file.clone();
-                async move {
-                    let tx = Transaction::new(table);
-                    let mut action = tx.fast_append(None, vec![])?;
-                    action.add_data_files(vec![data_file])?;
-                    let tx = action.apply().await?;
-                    let updated = tx.commit(catalog).await?;
-                    Ok(updated)
-                }
-            })
-            .await
-        };
+            let max_attempts = 5;
+            let mut delay = std::time::Duration::from_millis(100);
+            let mut last_err: Option<anyhow::Error> = None;
 
-        // On auth error, refresh the catalog client and retry once
-        let updated_table = match updated_table {
-            Err(e) if crate::error::is_auth_error(&e) => {
-                warn!(error = %e, "Iceberg commit auth error, refreshing catalog and retrying");
-                self.force_refresh_catalog();
-                self.tables.remove(table_name);
-                self.ensure_table(table_name).await?;
+            let mut result = None;
+            for attempt in 1..=max_attempts {
                 let table = self.tables.get(table_name).unwrap();
                 let tx = Transaction::new(table);
-                let mut action = tx.fast_append(None, vec![])?;
-                action.add_data_files(vec![data_file])?;
-                let tx = action.apply().await?;
-                tx.commit(&self.catalog).await?
+                let commit_result = async {
+                    let mut action = tx.fast_append(None, vec![])?;
+                    action.add_data_files(vec![data_file.clone()])?;
+                    let tx = action.apply().await?;
+                    let updated = tx.commit(&self.catalog).await?;
+                    Ok::<_, anyhow::Error>(updated)
+                }.await;
+
+                match commit_result {
+                    Ok(updated) => {
+                        result = Some(updated);
+                        break;
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string().to_lowercase();
+                        let is_conflict = err_msg.contains("409")
+                            || err_msg.contains("commitfailed")
+                            || err_msg.contains("requirement failed");
+                        let is_auth = crate::error::is_auth_error(&e);
+
+                        if attempt == max_attempts || (!is_conflict && !is_auth) {
+                            return Err(e);
+                        }
+
+                        if is_auth {
+                            warn!(error = %e, attempt, "Iceberg commit auth error, refreshing catalog");
+                            self.force_refresh_catalog();
+                            self.tables.remove(table_name);
+                            self.ensure_table(table_name).await?;
+                        } else {
+                            // Conflict: reload table to get latest snapshot
+                            warn!(error = %e, attempt, delay_ms = delay.as_millis() as u64, "Iceberg commit conflict, reloading table");
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                            self.tables.remove(table_name);
+                            self.ensure_table(table_name).await?;
+                        }
+
+                        last_err = Some(e);
+                    }
+                }
             }
-            other => other?,
+            result.ok_or_else(|| last_err.unwrap())?
         };
 
         // Update cached table with new snapshot
