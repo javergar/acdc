@@ -19,6 +19,7 @@ set -uo pipefail
 
 DURATION_SECS=${1:-14400}  # default 4 hours, override with first arg
 MYSQL="docker exec -i acdc-mysql mysql -u root -proot --batch -N laravel_app"
+export MYSQL
 
 START=$(date +%s)
 END=$((START + DURATION_SECS))

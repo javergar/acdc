@@ -10,12 +10,14 @@
 #   ./tests/laravel/profile-run.sh 60    # 1-hour run
 # =============================================================================
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_DIR"
 
 DURATION_MIN=${1:-240}
 DURATION_SECS=$((DURATION_MIN * 60))
 MYSQL="docker exec -i acdc-mysql mysql -u root -proot --batch -N"
-CONFIG="tests/laravel/acdc-laravel.toml"
+CONFIG="$PROJECT_DIR/tests/laravel/acdc-laravel.toml"
 LOG_DIR="/tmp/acdc-profile-$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
 
@@ -39,12 +41,12 @@ echo ""
 echo "--- Resetting laravel_app database..."
 $MYSQL -e "DROP DATABASE IF EXISTS laravel_app;" 2>/dev/null
 $MYSQL -e "CREATE DATABASE laravel_app CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" 2>/dev/null
-$MYSQL laravel_app < tests/laravel/schema.sql 2>/dev/null
+$MYSQL laravel_app < $SCRIPT_DIR/schema.sql 2>/dev/null
 TABLE_COUNT=$($MYSQL -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='laravel_app';" 2>/dev/null)
 echo "    $TABLE_COUNT tables created"
 
 # Seed baseline data so the load generator has something to update
-$MYSQL laravel_app < tests/laravel/workload.sql 2>/dev/null
+$MYSQL laravel_app < $SCRIPT_DIR/workload.sql 2>/dev/null
 echo "    Baseline data seeded"
 echo ""
 
@@ -98,12 +100,17 @@ echo ""
 echo "--- Starting sustained load (${DURATION_MIN} min)..."
 echo "    Load log: $LOG_DIR/load.log"
 echo ""
-bash tests/laravel/sustained-load.sh "$DURATION_SECS" > "$LOG_DIR/load.log" 2>&1 &
+bash "$SCRIPT_DIR/sustained-load.sh" "$DURATION_SECS" > "$LOG_DIR/load.log" 2>&1 &
 LOAD_PID=$!
 
 # ─── 5. Live status display ─────────────────────────────────────────────────
 
-REPORT_INTERVAL=60  # seconds between status lines
+# Report every 60s for long runs, every 15s for short runs
+if [ "$DURATION_MIN" -le 10 ]; then
+    REPORT_INTERVAL=15
+else
+    REPORT_INTERVAL=60
+fi
 echo "--- Live status (every ${REPORT_INTERVAL}s):"
 echo ""
 printf "%-10s  %8s  %8s  %6s  %6s  %10s  %s\n" \
