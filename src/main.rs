@@ -20,8 +20,8 @@ use crate::pipeline::Pipeline;
 use crate::sink::iceberg::IcebergSink;
 use crate::sink::parquet::{LocalParquetWriter, S3ParquetWriter};
 use crate::sink::SinkWriter;
-use crate::source::binlog::BinlogSource;
-use crate::source::schema::introspect_tables;
+use crate::source::binlog::{BinlogPosition, BinlogSource};
+use crate::source::schema::{introspect_tables, TableMeta};
 use crate::source::snapshot::SnapshotReader;
 use crate::source::types::PipelineMessage;
 use crate::state::{BinlogOffset, OffsetStore};
@@ -159,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
     let mut writer = match config.sink.mode {
         SinkMode::Iceberg => {
             info!("Using Iceberg sink writer");
-            SinkWriter::Iceberg(IcebergSink::new(&config.sink, &tables).await?)
+            SinkWriter::Iceberg(Box::new(IcebergSink::new(&config.sink, &tables).await?))
         }
         SinkMode::S3 => {
             info!("Using S3 sink writer");
@@ -170,23 +170,60 @@ async fn main() -> anyhow::Result<()> {
             SinkWriter::Local(LocalParquetWriter::new(&config.sink.output_dir)?)
         }
     };
-    let flush_interval = Duration::from_secs(config.sink.writer.flush_interval_secs);
 
-    // --- Snapshot phase (if configured and not already done) ---
-    let _snapshot_span = info_span!("snapshot").entered();
+    // --- Snapshot phase ---
+    let binlog_start_pos = run_snapshot(
+        &pool, &config, &tables, &sequence, &shutdown,
+        &mut writer, &offset_store, &mut pipeline, saved_offset,
+    ).await?;
+
+    // Track snapshot completion state for periodic offset saves
+    let snapshot_state: Arc<HashMap<String, bool>> = Arc::new(
+        if binlog_start_pos.is_some()
+            && matches!(config.source.mode, SourceMode::FullLoadThenCdc)
+        {
+            config.source.tables.iter().map(|t| (t.clone(), true)).collect()
+        } else {
+            HashMap::new()
+        }
+    );
+
+    // --- CDC phase + shutdown ---
+    run_cdc(
+        pool, &config, tables, sequence, shutdown,
+        &mut writer, &offset_store, &mut pipeline,
+        binlog_start_pos, snapshot_state, health_state,
+    ).await
+}
+
+/// Run the initial snapshot phase if configured and not already completed.
+/// Returns the binlog position to resume CDC from.
+#[allow(clippy::too_many_arguments)]
+async fn run_snapshot(
+    pool: &mysql_async::Pool,
+    config: &Config,
+    tables: &[TableMeta],
+    sequence: &Arc<AtomicI64>,
+    shutdown: &Arc<AtomicBool>,
+    writer: &mut SinkWriter,
+    offset_store: &Option<OffsetStore>,
+    pipeline: &mut Pipeline,
+    saved_offset: Option<BinlogOffset>,
+) -> anyhow::Result<Option<BinlogPosition>> {
+    let _span = info_span!("snapshot").entered();
     let snapshot_already_done = saved_offset
         .as_ref()
         .map(|o| !o.snapshot_complete.is_empty())
         .unwrap_or(false);
 
-    let binlog_start_pos = match config.source.mode {
+    match config.source.mode {
         SourceMode::FullLoadThenCdc if !snapshot_already_done => {
             info!("Running initial snapshot (full_load_then_cdc mode)...");
 
             let snapshot_reader = SnapshotReader::new(
                 pool.clone(),
                 config.source.clone(),
-                tables.clone(),
+                tables.to_vec(),
                 sequence.clone(),
             );
 
@@ -217,12 +254,14 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Save per-table snapshot progress when a new table completes
-                let done = completed_tables.lock().unwrap_or_else(|e| e.into_inner());
-                let done_count = done.len();
-                if done_count > last_saved_count {
-                    let done_tables = done.clone();
-                    drop(done); // release lock before async work
-                    // Flush buffered data for completed table
+                let (done_count, done_tables) = {
+                    let done = completed_tables.lock().unwrap_or_else(|e| e.into_inner());
+                    let count = done.len();
+                    let tables = if count > last_saved_count { Some(done.clone()) } else { None };
+                    (count, tables)
+                }; // lock dropped here, before any .await
+
+                if let Some(done_tables) = done_tables {
                     let batches = pipeline.flush_all();
                     for (table_id, batch) in &batches {
                         writer.write_batch(&table_id.table, batch).await?;
@@ -271,48 +310,52 @@ async fn main() -> anyhow::Result<()> {
                 store.save(&offset).await?;
             }
 
-            Some(binlog_pos)
+            Ok(Some(binlog_pos))
         }
         SourceMode::FullLoadThenCdc => {
-            // Snapshot already done, resume from saved offset
             info!("Snapshot already complete, resuming CDC from saved offset");
-            saved_offset.map(|o| source::binlog::BinlogPosition {
+            Ok(saved_offset.map(|o| BinlogPosition {
                 filename: o.binlog_file,
                 position: o.binlog_position,
-            })
+            }))
         }
         SourceMode::CdcOnly => {
-            // Resume from saved offset if available
-            saved_offset.map(|o| source::binlog::BinlogPosition {
+            Ok(saved_offset.map(|o| BinlogPosition {
                 filename: o.binlog_file,
                 position: o.binlog_position,
-            })
+            }))
         }
-    };
+    }
+}
 
-    // Track snapshot completion state for periodic offset saves (Arc to avoid clone per save)
-    let snapshot_state: Arc<HashMap<String, bool>> = Arc::new(if (snapshot_already_done
-        || matches!(binlog_start_pos, Some(_)))
-        && matches!(config.source.mode, SourceMode::FullLoadThenCdc)
-    {
-        config.source.tables.iter().map(|t| (t.clone(), true)).collect()
-    } else {
-        HashMap::new()
-    });
-
-    // --- CDC phase ---
-    drop(_snapshot_span);
-    let _cdc_span = info_span!("cdc").entered();
+/// Run the CDC main loop: stream binlog events, buffer, flush, and save offsets.
+/// Includes graceful shutdown logic.
+#[allow(clippy::too_many_arguments)]
+async fn run_cdc(
+    pool: mysql_async::Pool,
+    config: &Config,
+    tables: Vec<TableMeta>,
+    sequence: Arc<AtomicI64>,
+    shutdown: Arc<AtomicBool>,
+    writer: &mut SinkWriter,
+    offset_store: &Option<OffsetStore>,
+    pipeline: &mut Pipeline,
+    binlog_start_pos: Option<BinlogPosition>,
+    snapshot_state: Arc<HashMap<String, bool>>,
+    health_state: Arc<Mutex<HealthState>>,
+) -> anyhow::Result<()> {
+    let _span = info_span!("cdc").entered();
+    let flush_interval = Duration::from_secs(config.sink.writer.flush_interval_secs);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PipelineMessage>(1024);
 
-    let shared_binlog_pos = Arc::new(Mutex::new(source::binlog::BinlogPosition {
+    let shared_binlog_pos = Arc::new(Mutex::new(BinlogPosition {
         filename: String::new(),
         position: 0,
     }));
 
     let mut binlog_source =
-        BinlogSource::new(pool.clone(), config.source.clone(), tables.clone(), sequence.clone(), shared_binlog_pos.clone())
+        BinlogSource::new(pool.clone(), config.source.clone(), tables, sequence.clone(), shared_binlog_pos.clone())
             .await?;
     let shutdown_for_source = shutdown.clone();
     let source_handle = tokio::spawn(async move {
@@ -328,7 +371,6 @@ async fn main() -> anyhow::Result<()> {
         "Listening for binlog events..."
     );
 
-    // Main event loop using tokio::select! for composable signal handling
     let start_time = Instant::now();
     let mut last_stats_seq: i64 = sequence.load(Ordering::Relaxed);
 
@@ -405,7 +447,6 @@ async fn main() -> anyhow::Result<()> {
                     uptime_secs = start_time.elapsed().as_secs(),
                     "Stats"
                 );
-                // Update health state with current binlog position
                 {
                     let mut hs = health_state.lock().unwrap_or_else(|e| e.into_inner());
                     hs.binlog_file = pos.filename;

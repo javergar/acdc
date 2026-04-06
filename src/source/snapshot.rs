@@ -118,19 +118,49 @@ impl SnapshotReader {
         info!(table, pk_columns = ?pk_cols, chunk_size, "Starting snapshot for table");
 
         if pk_cols.is_empty() {
-            // No primary key — full table scan (no chunking)
-            warn!(table, "No primary key, doing full table scan without chunking");
-            let query = format!("SELECT {} FROM `{}`.`{}`", select_cols, db, table);
-            let rows: Vec<mysql_async::Row> = conn.query(&query).await?;
-            for row in rows {
+            // No primary key — paginate with LIMIT/OFFSET to avoid loading entire table into memory.
+            // Without a PK there is no reliable ORDER BY key, so row ordering is not guaranteed
+            // across chunks; this is acceptable for an append-only snapshot.
+            warn!(table, "No primary key, using LIMIT/OFFSET pagination");
+            let mut page_offset: u64 = 0;
+
+            loop {
                 if shutdown.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                let event = self.row_to_event(row, table_meta, snapshot_ts);
-                if tx.send(PipelineMessage::Event(event)).await.is_err() {
-                    return Err(SourceError::ChannelClosed);
+
+                let query = format!(
+                    "SELECT {} FROM `{}`.`{}` LIMIT {} OFFSET {}",
+                    select_cols, db, table, chunk_size, page_offset
+                );
+                let rows: Vec<mysql_async::Row> = conn.query(&query).await?;
+                if rows.is_empty() {
+                    break;
                 }
-                total_rows += 1;
+
+                let chunk_len = rows.len();
+                for row in rows {
+                    let event = self.row_to_event(row, table_meta, snapshot_ts);
+                    if tx.send(PipelineMessage::Event(event)).await.is_err() {
+                        return Err(SourceError::ChannelClosed);
+                    }
+                    total_rows += 1;
+                }
+
+                debug!(
+                    table,
+                    chunk_rows = chunk_len,
+                    total_rows,
+                    "Snapshot chunk (no PK)"
+                );
+                if total_rows % 100_000 < chunk_size as u64 && total_rows >= 100_000 {
+                    info!(table, rows_so_far = total_rows, "Snapshot progress");
+                }
+
+                page_offset += chunk_len as u64;
+                if chunk_len < chunk_size {
+                    break;
+                }
             }
         } else if pk_cols.len() == 1 {
             // Single-column PK — simple pagination

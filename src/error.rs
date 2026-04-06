@@ -35,6 +35,13 @@ fn is_retryable(err: &anyhow::Error) -> bool {
     true
 }
 
+/// Check if an error looks like an authentication/authorization failure.
+pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("unauthorized") || msg.contains("forbidden")
+        || msg.contains("access denied") || msg.contains("401") || msg.contains("403")
+}
+
 /// Retry an async operation with exponential backoff.
 /// Starts at 100ms, doubles each attempt, caps at 30s.
 /// Non-retryable errors (auth, client errors) fail immediately.

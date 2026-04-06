@@ -16,6 +16,7 @@ use crate::config::SinkConfig;
 use crate::error::retry;
 
 /// Writes RecordBatches as local Parquet files.
+#[derive(Clone)]
 pub struct LocalParquetWriter {
     output_dir: PathBuf,
 }
@@ -27,7 +28,7 @@ impl LocalParquetWriter {
         Ok(Self { output_dir })
     }
 
-    pub fn write_batch(&mut self, table: &str, batch: &RecordBatch) -> anyhow::Result<String> {
+    pub fn write_batch(&self, table: &str, batch: &RecordBatch) -> anyhow::Result<String> {
         let write_start = Instant::now();
         let table_dir = self.output_dir.join(table);
         fs::create_dir_all(&table_dir)?;

@@ -149,11 +149,16 @@ impl IcebergSink {
     fn refresh_catalog_if_needed(&mut self) {
         const TOKEN_REFRESH_SECS: u64 = 50 * 60;
         if self.catalog_created_at.elapsed().as_secs() > TOKEN_REFRESH_SECS {
-            info!("Refreshing Iceberg catalog client (token rotation)");
-            self.catalog = RestCatalog::new(self.catalog_config.clone());
-            self.tables.clear(); // table handles carry the old token's FileIO
-            self.catalog_created_at = Instant::now();
+            self.force_refresh_catalog();
         }
+    }
+
+    /// Unconditionally recreate the catalog client (e.g. after an auth error).
+    fn force_refresh_catalog(&mut self) {
+        info!("Refreshing Iceberg catalog client (token rotation)");
+        self.catalog = RestCatalog::new(self.catalog_config.clone());
+        self.tables.clear(); // table handles carry the old token's FileIO
+        self.catalog_created_at = Instant::now();
     }
 
     /// Ensure an Iceberg table exists, creating it if needed. Returns the table handle.
@@ -294,20 +299,39 @@ impl IcebergSink {
             .map_err(|e| anyhow::anyhow!("Failed to build DataFile: {}", e))?;
 
         // 5. Commit to Iceberg catalog via transaction (with retry for transient failures)
-        let table = self.tables.get(table_name).unwrap();
-        let catalog = &self.catalog;
-        let updated_table = retry("iceberg_commit", 3, || {
-            let data_file = data_file.clone();
-            async move {
+        let updated_table = {
+            let table = self.tables.get(table_name).unwrap();
+            let catalog = &self.catalog;
+            retry("iceberg_commit", 3, || {
+                let data_file = data_file.clone();
+                async move {
+                    let tx = Transaction::new(table);
+                    let mut action = tx.fast_append(None, vec![])?;
+                    action.add_data_files(vec![data_file])?;
+                    let tx = action.apply().await?;
+                    let updated = tx.commit(catalog).await?;
+                    Ok(updated)
+                }
+            })
+            .await
+        };
+
+        // On auth error, refresh the catalog client and retry once
+        let updated_table = match updated_table {
+            Err(e) if crate::error::is_auth_error(&e) => {
+                warn!(error = %e, "Iceberg commit auth error, refreshing catalog and retrying");
+                self.force_refresh_catalog();
+                self.tables.remove(table_name);
+                self.ensure_table(table_name).await?;
+                let table = self.tables.get(table_name).unwrap();
                 let tx = Transaction::new(table);
                 let mut action = tx.fast_append(None, vec![])?;
                 action.add_data_files(vec![data_file])?;
                 let tx = action.apply().await?;
-                let updated = tx.commit(catalog).await?;
-                Ok(updated)
+                tx.commit(&self.catalog).await?
             }
-        })
-        .await?;
+            other => other?,
+        };
 
         // Update cached table with new snapshot
         self.tables.insert(table_name.to_string(), updated_table);

@@ -85,7 +85,8 @@ pub fn mysql_type_to_arrow(col: &ColumnMeta) -> DataType {
         MysqlType::Smallint { unsigned: false } => DataType::Int16,
         MysqlType::Mediumint { unsigned: true } | MysqlType::Int { unsigned: true } => DataType::Int64,
         MysqlType::Mediumint { unsigned: false } | MysqlType::Int { unsigned: false } => DataType::Int32,
-        MysqlType::Bigint { .. } => DataType::Int64,
+        MysqlType::Bigint { unsigned: false } => DataType::Int64,
+        MysqlType::Bigint { unsigned: true } => DataType::Decimal128(20, 0),
         MysqlType::Float => DataType::Float32,
         MysqlType::Double => DataType::Float64,
         MysqlType::Decimal { precision, scale } => DataType::Decimal128(*precision, *scale),
@@ -160,7 +161,7 @@ pub fn build_arrow_schema(columns: &[ColumnMeta]) -> Arc<Schema> {
 /// Extract base type name before '(' or ' '.
 fn mysql_base_type(mysql_type: &str) -> &str {
     let s = mysql_type.trim();
-    let end = s.find(|c: char| c == '(' || c == ' ').unwrap_or(s.len());
+    let end = s.find(['(', ' ']).unwrap_or(s.len());
     &s[..end]
 }
 
@@ -168,7 +169,7 @@ fn mysql_base_type(mysql_type: &str) -> &str {
 /// Arrow Decimal128 supports precision up to 38.
 fn parse_precision_scale(mysql_type: &str) -> (u8, i8) {
     let (p, s) = parse_precision_scale_inner(mysql_type);
-    let clamped_p = p.min(38).max(1);
+    let clamped_p = p.clamp(1, 38);
     let clamped_s = s.min(clamped_p as i8);
     if clamped_p != p || clamped_s != s {
         tracing::warn!(
@@ -333,9 +334,16 @@ mod tests {
     }
 
     #[test]
-    fn bigint_always_int64() {
+    fn bigint_signed_int64() {
         assert_eq!(mysql_type_to_arrow(&col("bigint")), DataType::Int64);
-        assert_eq!(mysql_type_to_arrow(&col("bigint unsigned")), DataType::Int64);
+    }
+
+    #[test]
+    fn bigint_unsigned_decimal() {
+        assert_eq!(
+            mysql_type_to_arrow(&col("bigint unsigned")),
+            DataType::Decimal128(20, 0)
+        );
     }
 
     #[test]

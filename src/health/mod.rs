@@ -75,7 +75,9 @@ async fn handle_health_connection(
     state: Arc<Mutex<HealthState>>,
     flush_interval_secs: u64,
 ) {
-    // Read the request line
+    // Read the first chunk of the request. A single read may not capture all HTTP headers
+    // if a client sends them across multiple TCP segments, but we only need the request
+    // line (e.g. "GET /health") for this internal health check endpoint.
     let mut buf = [0u8; 1024];
     let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap_or(0);
     let request_line = std::str::from_utf8(&buf[..n])
