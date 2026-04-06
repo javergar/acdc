@@ -132,6 +132,12 @@ pub struct ObservabilityConfig {
     pub health_check_bind: String,
     #[serde(default = "default_stats_interval")]
     pub stats_interval_secs: u64,
+    /// Optional log file path with daily rotation. When set, logs go to both
+    /// stderr and rotating files (e.g. "/var/log/acdc/acdc.log" creates
+    /// acdc.log.2026-04-06, acdc.log.2026-04-07, etc.).
+    /// When unset (default), logs go to stderr only — suitable for
+    /// ECS/Docker where the container runtime handles log collection.
+    pub log_file: Option<String>,
 }
 
 fn default_source_mode() -> SourceMode {

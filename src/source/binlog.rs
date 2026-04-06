@@ -110,7 +110,9 @@ impl BinlogSource {
         loop {
             let result = tokio::select! {
                 item = binlog_stream.next() => {
-                    was_idle = false;
+                    // Don't reset was_idle here — only reset when we actually
+                    // process a tracked row event (below), to avoid logging
+                    // "caught up" on every heartbeat/untracked event.
                     match item {
                         Some(r) => r,
                         None => break, // stream ended
@@ -122,7 +124,7 @@ impl BinlogSource {
                         break;
                     }
                     if !was_idle {
-                        info!(
+                        debug!(
                             binlog_file = %current_position.filename,
                             binlog_position = current_position.position,
                             "CDC caught up — tailing live binlog"
@@ -296,6 +298,7 @@ impl BinlogSource {
                             values: columns,
                         };
 
+                        was_idle = false;
                         if tx.send(PipelineMessage::Event(cdc_event)).await.is_err() {
                             debug!("Channel closed, stopping binlog reader");
                             return Ok(current_position);

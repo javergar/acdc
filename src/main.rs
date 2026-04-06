@@ -548,19 +548,48 @@ fn print_banner(config: &Config) {
 }
 
 fn init_tracing(config: &config::ObservabilityConfig) {
+    use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("acdc={}", config.log_level)));
 
-    if config.json_logs {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .init();
+    match &config.log_file {
+        Some(log_path) => {
+            // Log to both stderr AND a daily-rotating file
+            let path = std::path::Path::new(log_path);
+            let dir = path.parent().unwrap_or(std::path::Path::new("."));
+            let filename = path
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("acdc.log"))
+                .to_string_lossy();
+
+            let file_appender =
+                tracing_appender::rolling::daily(dir, filename.as_ref());
+
+            if config.json_logs {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .json()
+                    .with_writer(file_appender.and(std::io::stderr))
+                    .init();
+            } else {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(file_appender.and(std::io::stderr))
+                    .init();
+            }
+        }
+        None => {
+            // Stderr only (default — let ECS/Docker handle log collection)
+            if config.json_logs {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .json()
+                    .init();
+            } else {
+                tracing_subscriber::fmt().with_env_filter(filter).init();
+            }
+        }
     }
 }

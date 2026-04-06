@@ -66,6 +66,28 @@ batch_size = 10000          # rows per flush
 flush_interval_secs = 30    # max seconds between flushes
 ```
 
+### Observability
+
+```toml
+[observability]
+log_level = "info"           # trace, debug, info, warn, error
+json_logs = false            # true for structured JSON (CloudWatch, Datadog)
+health_check_bind = "0.0.0.0:8080"
+stats_interval_secs = 30     # how often to log throughput stats
+# log_file = "/var/log/acdc/acdc.log"  # optional: daily-rotating file
+```
+
+**Logging in production:**
+
+By default, logs go to stderr. This is correct for ECS (use `awslogs` driver), Docker (`json-file` with `max-size`), or systemd (`journald`). Set `json_logs = true` for structured logging.
+
+If running outside a container runtime, set `log_file` to enable daily-rotating file output (logs go to both stderr and the file). Old log files are NOT automatically deleted — use logrotate or a cron job to clean them.
+
+To control log volume in production:
+- `log_level = "info"` is the right default (~1-5 KB per flush cycle)
+- `log_level = "warn"` for minimal output (only problems)
+- `stats_interval_secs = 60` or higher to reduce stats line frequency
+
 ### Sink Modes
 
 - **`local`** — writes Parquet files to `output_dir` on the local filesystem
